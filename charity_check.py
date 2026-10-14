@@ -4,7 +4,8 @@
 Give it a CSV (or a plain list) of EINs. It downloads the IRS Publication 78 list
 (organizations eligible to receive tax-deductible contributions) and the
 automatic-revocation list, optionally the Exempt Organizations Business Master
-File (EO BMF), and writes your file back with a status for every row.
+File (EO BMF) and the Form 990-N (e-Postcard) file, and writes your file back
+with a status for every row.
 
 Standard library only. Information from public IRS data, not legal or tax advice.
 By MV2 of Munim, Inc. MIT license.
@@ -21,14 +22,17 @@ import time
 import urllib.request
 import zipfile
 from datetime import date, datetime, timezone
+from html import escape
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 PUB78_URL = "https://apps.irs.gov/pub/epostcard/data-download-pub78.zip"
 REVOCATION_URL = "https://apps.irs.gov/pub/epostcard/data-download-revocation.zip"
+EPOSTCARD_URL = "https://apps.irs.gov/pub/epostcard/data-download-epostcard.zip"
 BMF_URLS = ["https://www.irs.gov/pub/irs-soi/eo%d.csv" % n for n in (1, 2, 3, 4)]
 TEOS_URL = "https://apps.irs.gov/app/eos/"
-USER_AGENT = "charity-check/%s (+https://github.com/munimv2/charity-check)" % __version__
+REPO_URL = "https://github.com/munimv2/charity-check"
+USER_AGENT = "charity-check/%s (+%s)" % (__version__, REPO_URL)
 
 # https://www.irs.gov/charities-non-profits/tax-exempt-organization-search-deductibility-status-codes
 PUB78_CODES = {
@@ -59,6 +63,8 @@ PUB78_FLAGS = {
     "SONFI": "type3_non_functionally_integrated",
     "SOUNK": "supporting_org_type_unknown",
 }
+
+OTHER_FLAGS = ("reinstated_after_revocation", "church", "group_subordinate", "terminated_990n")
 
 # EO BMF foundation codes (IRS eo-info.pdf).
 FOUNDATION_CODES = {
@@ -92,16 +98,21 @@ OUTPUT_FIELDS = (
     "ein_9", "irs_status", "irs_deductible", "irs_pub78_code", "irs_pub78_meaning",
     "irs_name", "irs_city", "irs_state", "irs_revocation_date",
     "irs_reinstatement_date", "irs_subsection", "irs_foundation_code",
-    "irs_foundation_meaning", "irs_ruling", "irs_ntee", "irs_flags", "irs_note",
+    "irs_foundation_meaning", "irs_ruling", "irs_ntee", "irs_990n_tax_year",
+    "irs_990n_terminated", "irs_flags", "irs_note",
 )
 
 STATUSES = ("eligible", "listed_bmf_not_pub78", "exempt_not_501c3", "revoked",
             "review", "not_found", "invalid_ein")
 
+KNOWN_FLAGS = tuple(PUB78_FLAGS.values()) + OTHER_FLAGS
+
 MONTHS = {m: i + 1 for i, m in enumerate(
     ("JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"))}
 
 EIN_HEADER = re.compile(r"(^|[^a-z])(ein|fein|tin)([^a-z]|$)|tax[ _-]?id|employer identification")
+
+TRUE_VALUES = ("T", "Y", "TRUE", "YES", "1")
 
 
 def normalize_ein(raw):
@@ -130,7 +141,7 @@ def format_ein(ein9):
 
 
 def parse_irs_date(raw):
-    """'15-MAY-2010' -> '2010-05-15'. ISO and MM/DD/YYYY pass through; other text is kept as is."""
+    """'15-MAY-2010' -> '2010-05-15'. ISO, MM/DD/YYYY and MM-DD-YYYY too; other text is kept as is."""
     s = (raw or "").strip()
     if not s:
         return ""
@@ -140,7 +151,7 @@ def parse_irs_date(raw):
     m = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})", s)
     if m:
         return s
-    m = re.fullmatch(r"(\d{1,2})/(\d{1,2})/(\d{4})", s)
+    m = re.fullmatch(r"(\d{1,2})[/-](\d{1,2})[/-](\d{4})", s)
     if m:
         return "%s-%02d-%02d" % (m.group(3), int(m.group(1)), int(m.group(2)))
     return s
@@ -214,6 +225,39 @@ def load_revocations(path, wanted):
     return found
 
 
+def load_epostcard(path, wanted):
+    """Form 990-N file (26 pipe-delimited fields) -> {ein: latest filing} for wanted EINs.
+
+    Fields used: 0 EIN, 1 tax year, 2 name, 4 terminated (T/F), 6 tax period end,
+    18 organization city, 20 organization state (IRS 990-N data dictionary).
+    """
+    found = {}
+    for line in iter_lines(path):
+        parts = line.rstrip("\r\n").split("|")
+        if len(parts) < 7:
+            continue
+        parts = (parts + [""] * 26)[:26]
+        ein = parts[0].strip()
+        if not ein.isdigit():
+            continue
+        ein = ein.zfill(9)
+        if ein not in wanted:
+            continue
+        year = re.sub(r"\D", "", parts[1])[:4]
+        rec = {
+            "tax_year": year,
+            "name": parts[2].strip(),
+            "terminated": parts[4].strip().upper() in TRUE_VALUES,
+            "period_end": parse_irs_date(parts[6]),
+            "city": parts[18].strip(),
+            "state": parts[20].strip(),
+        }
+        old = found.get(ein)
+        if old is None or (rec["tax_year"], rec["period_end"]) >= (old["tax_year"], old["period_end"]):
+            found[ein] = rec
+    return found
+
+
 def load_bmf(paths, wanted):
     """EO BMF CSV files (with header row) -> {ein: {field: value}} for wanted EINs."""
     found = {}
@@ -235,7 +279,7 @@ def latest_revocation(records):
     return max(records, key=lambda r: (r["revocation_date"], r["posting_date"]))
 
 
-def assess(ein, pub78, revocations, bmf, bmf_checked=False):
+def assess(ein, pub78, revocations, bmf, bmf_checked=False, epostcard=None):
     """Return the irs_* columns for one EIN."""
     out = dict.fromkeys(OUTPUT_FIELDS, "")
     if ein is None:
@@ -248,6 +292,7 @@ def assess(ein, pub78, revocations, bmf, bmf_checked=False):
     p = pub78.get(ein)
     rev = latest_revocation(revocations.get(ein))
     b = bmf.get(ein)
+    n = (epostcard or {}).get(ein)
     revoked_now = bool(rev) and not rev["reinstatement_date"]
 
     if p:
@@ -277,6 +322,13 @@ def assess(ein, pub78, revocations, bmf, bmf_checked=False):
             flags.append("church")
         if b["AFFILIATION"] == "9" and b["GROUP"].strip("0"):
             flags.append("group_subordinate")
+    if n:
+        out["irs_990n_tax_year"] = n["tax_year"]
+        out["irs_990n_terminated"] = "yes" if n["terminated"] else "no"
+        if n["terminated"]:
+            flags.append("terminated_990n")
+        if not out["irs_name"]:
+            out["irs_name"], out["irs_city"], out["irs_state"] = n["name"], n["city"], n["state"]
 
     if p and revoked_now:
         out["irs_status"] = "review"
@@ -315,8 +367,21 @@ def assess(ein, pub78, revocations, bmf, bmf_checked=False):
             else "Publication 78 or the auto-revocation list"
         out["irs_note"] = ("Not in %s. It may be a church, a group-exemption subordinate, a government "
                            "unit, a typo or not exempt; look it up in IRS TEOS %s." % (where, TEOS_URL))
+        if n:
+            out["irs_note"] += " It did file a 990-N e-Postcard for tax year %s." % (n["tax_year"] or "unknown")
         if not bmf_checked:
             out["irs_note"] += " Re-run with --bmf to also search the Business Master File."
+
+    if n and n["terminated"]:
+        said = ("Its latest 990-N e-Postcard (tax year %s) says the organization has terminated."
+                % (n["tax_year"] or "unknown"))
+        if out["irs_status"] in ("eligible", "listed_bmf_not_pub78"):
+            out["irs_status"] = "review"
+            out["irs_deductible"] = "unknown"
+            out["irs_note"] = ("%s %s IRS lists can lag a termination; confirm the organization still "
+                               "operates before a grant." % (out["irs_note"], said))
+        else:
+            out["irs_note"] += " " + said
     out["irs_flags"] = ";".join(flags)
     return out
 
@@ -389,38 +454,167 @@ def download(url, dest, max_age_days=7, refresh=False):
     return dest
 
 
+def source_date(path):
+    """Best known date of a data file: the server's Last-Modified, else the download or file time."""
+    meta = path + ".json"
+    if os.path.exists(meta):
+        try:
+            with open(meta, encoding="utf-8") as fh:
+                info = json.load(fh)
+            if info.get("last_modified"):
+                return info["last_modified"]
+            if info.get("downloaded_at"):
+                return "downloaded " + info["downloaded_at"]
+        except (OSError, ValueError):
+            pass
+    try:
+        return "file dated " + datetime.fromtimestamp(os.path.getmtime(path), timezone.utc).strftime("%Y-%m-%d")
+    except OSError:
+        return ""
+
+
 def default_data_dir():
     base = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
     return os.path.join(base, "charity-check")
 
 
-def check(eins, pub78_path, revocation_path, bmf_paths=()):
+def check(eins, pub78_path, revocation_path, bmf_paths=(), epostcard_path=None):
     """Assess an iterable of raw EIN strings. Returns {raw: irs_* dict}."""
     normalized = {raw: normalize_ein(raw) for raw in eins}
     wanted = {e for e in normalized.values() if e}
     pub78 = load_pub78(pub78_path, wanted)
     revocations = load_revocations(revocation_path, wanted)
     bmf = load_bmf(bmf_paths, wanted) if bmf_paths else {}
-    return {raw: assess(e, pub78, revocations, bmf, bool(bmf_paths)) for raw, e in normalized.items()}
+    epostcard = load_epostcard(epostcard_path, wanted) if epostcard_path else {}
+    return {raw: assess(e, pub78, revocations, bmf, bool(bmf_paths), epostcard)
+            for raw, e in normalized.items()}
+
+
+def parse_fail_on(text):
+    """'revoked, review' -> ['revoked', 'review']; unknown names are an error."""
+    names = [t.strip() for t in re.split(r"[,;\s]+", text or "") if t.strip()]
+    unknown = [t for t in names if t not in STATUSES and t not in KNOWN_FLAGS]
+    if unknown:
+        raise SystemExit("charity-check: unknown --fail-on value(s): %s; use statuses (%s) or flags (%s)"
+                         % (", ".join(unknown), ", ".join(STATUSES), ", ".join(KNOWN_FLAGS)))
+    return names
+
+
+def matches_any(row, names):
+    flags = row["irs_flags"].split(";") if row["irs_flags"] else []
+    return row["irs_status"] in names or any(f in names for f in flags)
+
+
+def needs_look(row):
+    return row["irs_status"] != "eligible" or bool(row["irs_flags"])
+
+
+def count_statuses(rows):
+    counts = {}
+    for r in rows:
+        counts[r["irs_status"]] = counts.get(r["irs_status"], 0) + 1
+    return counts
+
+
+def render_html(rows, ein_field, sources, checked_on):
+    """A self-contained HTML report: totals, the rows that need a look, then every row."""
+    counts = count_statuses(rows)
+    look = [(i, r) for i, r in enumerate(rows, 1) if needs_look(r)]
+
+    def table(items):
+        out = ["<table><thead><tr><th>Row</th><th>EIN</th><th>IRS name</th><th>Location</th>"
+               "<th>Status</th><th>Code</th><th>Flags</th><th>Note</th></tr></thead><tbody>"]
+        for i, r in items:
+            place = ", ".join(x for x in (r["irs_city"], r["irs_state"]) if x)
+            out.append(
+                '<tr><td>%d</td><td>%s</td><td>%s</td><td>%s</td><td><span class="s %s">%s</span></td>'
+                "<td>%s</td><td>%s</td><td>%s</td></tr>" % (
+                    i, escape(r["ein_9"] or r.get(ein_field, "")), escape(r["irs_name"]), escape(place),
+                    escape(r["irs_status"]), escape(r["irs_status"]), escape(r["irs_pub78_code"]),
+                    escape(r["irs_flags"].replace(";", ", ")), escape(r["irs_note"])))
+        out.append("</tbody></table>")
+        return "\n".join(out)
+
+    parts = [
+        "<!doctype html>",
+        '<html lang="en"><head><meta charset="utf-8">',
+        '<meta name="viewport" content="width=device-width, initial-scale=1">',
+        "<title>charity-check report %s</title>" % escape(checked_on),
+        "<style>body{font:14px/1.45 system-ui,sans-serif;margin:2em;color:#222}"
+        "table{border-collapse:collapse;margin:1em 0}th,td{border:1px solid #ccc;padding:4px 8px;"
+        "text-align:left;vertical-align:top}th{background:#f3f3f3}.s{padding:1px 6px;border-radius:3px}"
+        ".eligible{background:#dff3df}.revoked,.invalid_ein{background:#f8d7d7}.review{background:#fde9c4}"
+        ".not_found,.listed_bmf_not_pub78,.exempt_not_501c3{background:#e6ecf5}small{color:#666}</style>",
+        "</head><body>",
+        "<h1>charity-check report</h1>",
+        "<p>%d rows checked on %s with charity-check %s.</p>" % (len(rows), escape(checked_on), __version__),
+        "<h2>Totals</h2><table><thead><tr><th>Status</th><th>Rows</th></tr></thead><tbody>",
+    ]
+    for s in STATUSES:
+        if s in counts:
+            parts.append('<tr><td><span class="s %s">%s</span></td><td>%d</td></tr>' % (s, s, counts[s]))
+    parts.append("</tbody></table>")
+    parts.append("<h2>Rows that need a look (%d)</h2>" % len(look))
+    parts.append(table(look) if look else "<p>None: every row is in Publication 78 with no flags.</p>")
+    parts.append("<details><summary>All %d rows</summary>" % len(rows))
+    parts.append(table(list(enumerate(rows, 1))))
+    parts.append("</details>")
+    parts.append("<h2>IRS data used</h2><ul>")
+    for label, path in sources:
+        parts.append("<li>%s: %s</li>" % (escape(label), escape(source_date(path) or "date unknown")))
+    parts.append("</ul>")
+    parts.append("<p><small>Information from public IRS data, not legal or tax advice. IRS files lag by "
+                 "weeks; confirm large or unusual grants in <a href=\"%s\">IRS TEOS</a>. Made with "
+                 "<a href=\"%s\">charity-check</a> by MV2 of Munim, Inc.</small></p>" % (TEOS_URL, REPO_URL))
+    parts.append("</body></html>")
+    return "\n".join(parts) + "\n"
+
+
+def render_markdown(rows, ein_field, limit=50):
+    """A short Markdown summary, e.g. for a GitHub Actions job summary."""
+    counts = count_statuses(rows)
+    lines = ["### charity-check: %d rows" % len(rows), "", "| status | rows |", "|---|---|"]
+    lines += ["| %s | %d |" % (s, counts[s]) for s in STATUSES if s in counts]
+    look = [(i, r) for i, r in enumerate(rows, 1) if needs_look(r)]
+    if look:
+        lines += ["", "| row | EIN | IRS name | status | flags |", "|---|---|---|---|---|"]
+        for i, r in look[:limit]:
+            cells = (r["ein_9"] or r.get(ein_field, ""), r["irs_name"], r["irs_status"],
+                     r["irs_flags"].replace(";", ", "))
+            lines.append("| %d | %s |" % (i, " | ".join(c.replace("|", "/") for c in cells)))
+        if len(look) > limit:
+            lines.append("")
+            lines.append("...and %d more rows that need a look." % (len(look) - limit))
+    return "\n".join(lines) + "\n"
 
 
 def build_parser():
     ap = argparse.ArgumentParser(
         prog="charity-check",
-        description="Bulk-check U.S. nonprofits (by EIN) against IRS Publication 78, "
-                    "the auto-revocation list and, optionally, the EO Business Master File.")
+        description="Bulk-check U.S. nonprofits (by EIN) against IRS Publication 78, the "
+                    "auto-revocation list and, optionally, the EO Business Master File and the "
+                    "990-N e-Postcard file.")
     ap.add_argument("inputs", nargs="+", metavar="INPUT",
                     help="a CSV with an EIN column, a text file of EINs, or EINs themselves")
     ap.add_argument("-o", "--output", help="output CSV (default: stdout)")
     ap.add_argument("--json", action="store_true", help="write JSON instead of CSV")
+    ap.add_argument("--html", help="also write a self-contained HTML report to this file")
+    ap.add_argument("--summary", help="append a Markdown summary to this file (e.g. $GITHUB_STEP_SUMMARY)")
+    ap.add_argument("--fail-on", default="",
+                    help="exit with status 1 if any row has one of these statuses or flags "
+                         "(comma-separated, e.g. revoked,review,terminated_990n)")
     ap.add_argument("--column", help="name of the EIN column if it is not detected")
     ap.add_argument("--bmf", action="store_true",
                     help="also download and search the EO Business Master File (about 1.9M rows)")
+    ap.add_argument("--990n", dest="use_990n", action="store_true",
+                    help="also download the Form 990-N e-Postcard file and flag organizations "
+                         "whose latest e-Postcard says they have terminated")
     ap.add_argument("--data-dir", default=None, help="where IRS files are cached (default: ~/.cache/charity-check)")
     ap.add_argument("--refresh", action="store_true", help="download fresh IRS files even if cached")
     ap.add_argument("--pub78", help="use this local Pub 78 file (zip or txt) instead of downloading")
     ap.add_argument("--revocation", help="use this local auto-revocation file (zip or txt)")
     ap.add_argument("--bmf-file", action="append", default=[], help="use this local EO BMF CSV (repeatable)")
+    ap.add_argument("--epostcard-file", help="use this local 990-N e-Postcard file (zip or txt)")
     ap.add_argument("--version", action="version", version="charity-check " + __version__)
     return ap
 
@@ -428,6 +622,7 @@ def build_parser():
 def main(argv=None):
     args = build_parser().parse_args(argv)
     data_dir = args.data_dir or default_data_dir()
+    fail_on = parse_fail_on(args.fail_on)
 
     fieldnames, rows, ein_field = [], [], "ein"
     loose = []
@@ -456,12 +651,19 @@ def main(argv=None):
     pub78_path = args.pub78 or download(PUB78_URL, os.path.join(data_dir, "pub78.zip"), refresh=args.refresh)
     rev_path = args.revocation or download(REVOCATION_URL, os.path.join(data_dir, "revocation.zip"),
                                            refresh=args.refresh)
+    sources = [("Publication 78", pub78_path), ("Automatic revocation list", rev_path)]
     bmf_paths = list(args.bmf_file)
     if args.bmf and not bmf_paths:
         bmf_paths = [download(u, os.path.join(data_dir, os.path.basename(u)), max_age_days=31,
                               refresh=args.refresh) for u in BMF_URLS]
+    sources += [("EO Business Master File (%s)" % os.path.basename(p), p) for p in bmf_paths]
+    epostcard_path = args.epostcard_file
+    if args.use_990n and not epostcard_path:
+        epostcard_path = download(EPOSTCARD_URL, os.path.join(data_dir, "epostcard.zip"), refresh=args.refresh)
+    if epostcard_path:
+        sources.append(("Form 990-N e-Postcard", epostcard_path))
 
-    results = check([row.get(ein_field, "") for row in rows], pub78_path, rev_path, bmf_paths)
+    results = check([row.get(ein_field, "") for row in rows], pub78_path, rev_path, bmf_paths, epostcard_path)
     checked_on = date.today().isoformat()
     out_rows = []
     for row in rows:
@@ -484,11 +686,21 @@ def main(argv=None):
         if args.output:
             out.close()
 
-    counts = {}
-    for r in out_rows:
-        counts[r["irs_status"]] = counts.get(r["irs_status"], 0) + 1
+    if args.html:
+        with open(args.html, "w", encoding="utf-8") as fh:
+            fh.write(render_html(out_rows, ein_field, sources, checked_on))
+    if args.summary:
+        with open(args.summary, "a", encoding="utf-8") as fh:
+            fh.write(render_markdown(out_rows, ein_field))
+
+    counts = count_statuses(out_rows)
     summary = ", ".join("%s %d" % (s, counts[s]) for s in STATUSES if s in counts)
     sys.stderr.write("charity-check: %d rows: %s\n" % (len(out_rows), summary))
+    if fail_on:
+        hits = [r for r in out_rows if matches_any(r, fail_on)]
+        if hits:
+            sys.stderr.write("charity-check: %d rows match --fail-on %s\n" % (len(hits), ",".join(fail_on)))
+            return 1
     return 0
 
 

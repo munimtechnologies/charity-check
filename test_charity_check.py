@@ -31,6 +31,22 @@ BMF = """EIN,NAME,ICO,STREET,CITY,STATE,ZIP,GROUP,SUBSECTION,AFFILIATION,CLASSIF
 """
 
 
+def epostcard_line(ein, year, name, terminated):
+    """One 26-field 990-N row in the IRS data dictionary's order."""
+    return "|".join([
+        ein, year, name, "T", terminated, "01-01-%s" % year, "12-31-%s" % year, "",
+        "Jo Officer", "1 Main St", "", "Austin", "", "TX", "78701", "US",
+        "1 Main St", "", "Austin", "", "TX", "78701", "US", "", "", ""])
+
+
+EPOSTCARD = "\n".join([
+    epostcard_line("333333333", "2022", "Reinstated Org", "F"),
+    epostcard_line("333333333", "2024", "Reinstated Org", "T"),
+    epostcard_line("777777777", "2024", "Smith & Jones <Club>", "F"),
+    epostcard_line("444444444", "2019", "Gone Charity", "T"),
+]) + "\n"
+
+
 class Fixture(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -44,6 +60,9 @@ class Fixture(unittest.TestCase):
         self.bmf = os.path.join(d, "eo1.csv")
         with open(self.bmf, "w", encoding="utf-8") as fh:
             fh.write(BMF)
+        self.epostcard = os.path.join(d, "epostcard.zip")
+        with zipfile.ZipFile(self.epostcard, "w") as zf:
+            zf.writestr("data-download-epostcard.txt", EPOSTCARD)
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -53,6 +72,9 @@ class Fixture(unittest.TestCase):
         with open(p, "w", encoding="utf-8", newline="") as fh:
             fh.write(text)
         return p
+
+    def local(self):
+        return ["--pub78", self.pub78, "--revocation", self.revocation]
 
 
 class TestNormalize(unittest.TestCase):
@@ -77,6 +99,7 @@ class TestDates(unittest.TestCase):
         self.assertEqual(cc.parse_irs_date("5-jan-2021"), "2021-01-05")
         self.assertEqual(cc.parse_irs_date("2010-05-15"), "2010-05-15")
         self.assertEqual(cc.parse_irs_date("07/15/2020"), "2020-07-15")
+        self.assertEqual(cc.parse_irs_date("12-31-2024"), "2024-12-31")
         self.assertEqual(cc.parse_irs_date(""), "")
         self.assertEqual(cc.parse_irs_date("sometime"), "sometime")
 
@@ -103,10 +126,21 @@ class TestLoaders(Fixture):
         self.assertEqual(got["555555555"]["FOUNDATION"], "10")
         self.assertEqual(got["666666666"]["SUBSECTION"], "04")
 
+    def test_epostcard_keeps_latest_year(self):
+        got = cc.load_epostcard(self.epostcard, {"333333333", "777777777", "999999999"})
+        self.assertEqual(set(got), {"333333333", "777777777"})
+        self.assertEqual(got["333333333"]["tax_year"], "2024")
+        self.assertTrue(got["333333333"]["terminated"])
+        self.assertEqual(got["333333333"]["period_end"], "2024-12-31")
+        self.assertFalse(got["777777777"]["terminated"])
+        self.assertEqual(got["777777777"]["city"], "Austin")
+        self.assertEqual(got["777777777"]["state"], "TX")
+
 
 class TestAssess(Fixture):
-    def run_check(self, eins, bmf=True):
-        return cc.check(eins, self.pub78, self.revocation, [self.bmf] if bmf else [])
+    def run_check(self, eins, bmf=True, epostcard=False):
+        return cc.check(eins, self.pub78, self.revocation, [self.bmf] if bmf else [],
+                        self.epostcard if epostcard else None)
 
     def test_statuses(self):
         r = self.run_check(["53-0196605", "131623829", "12345678", "222222222", "333333333",
@@ -143,6 +177,35 @@ class TestAssess(Fixture):
         self.assertEqual(r["555555555"]["irs_status"], "not_found")
         self.assertIn("--bmf", r["555555555"]["irs_note"])
 
+    def test_terminated_990n_turns_eligible_into_review(self):
+        r = self.run_check(["333333333"], epostcard=True)["333333333"]
+        self.assertEqual(r["irs_status"], "review")
+        self.assertEqual(r["irs_deductible"], "unknown")
+        self.assertEqual(r["irs_990n_tax_year"], "2024")
+        self.assertEqual(r["irs_990n_terminated"], "yes")
+        self.assertIn("terminated_990n", r["irs_flags"])
+        self.assertIn("reinstated_after_revocation", r["irs_flags"])
+        self.assertIn("has terminated", r["irs_note"])
+
+    def test_terminated_990n_keeps_revoked(self):
+        r = self.run_check(["444444444"], epostcard=True)["444444444"]
+        self.assertEqual(r["irs_status"], "revoked")
+        self.assertIn("terminated_990n", r["irs_flags"])
+        self.assertIn("tax year 2019", r["irs_note"])
+
+    def test_990n_only_filer(self):
+        r = self.run_check(["777777777"], epostcard=True)["777777777"]
+        self.assertEqual(r["irs_status"], "not_found")
+        self.assertEqual(r["irs_name"], "Smith & Jones <Club>")
+        self.assertEqual(r["irs_990n_terminated"], "no")
+        self.assertEqual(r["irs_flags"], "")
+        self.assertIn("990-N e-Postcard for tax year 2024", r["irs_note"])
+
+    def test_without_990n_columns_stay_empty(self):
+        r = self.run_check(["333333333"])["333333333"]
+        self.assertEqual(r["irs_status"], "eligible")
+        self.assertEqual(r["irs_990n_tax_year"], "")
+
 
 class TestReadInput(Fixture):
     def test_detects_tax_id_column(self):
@@ -170,23 +233,37 @@ class TestReadInput(Fixture):
             cc.read_input(p)
 
 
+class TestFailOn(unittest.TestCase):
+    def test_parse(self):
+        self.assertEqual(cc.parse_fail_on("revoked, review;terminated_990n"),
+                         ["revoked", "review", "terminated_990n"])
+        self.assertEqual(cc.parse_fail_on(""), [])
+        with self.assertRaises(SystemExit):
+            cc.parse_fail_on("revoked,bogus")
+
+    def test_matches_status_or_flag(self):
+        row = {"irs_status": "eligible", "irs_flags": "private_foundation;church"}
+        self.assertTrue(cc.matches_any(row, ["church"]))
+        self.assertFalse(cc.matches_any(row, ["revoked"]))
+        self.assertTrue(cc.matches_any({"irs_status": "revoked", "irs_flags": ""}, ["revoked"]))
+
+
 class TestMain(Fixture):
     def test_csv_end_to_end(self):
         src = self.path("grantees.csv", "Grantee,EIN,Amount\nRed Cross,53-0196605,500\nGone,444444444,250\n")
         out = os.path.join(self.tmp.name, "out.csv")
-        rc = cc.main([src, "-o", out, "--pub78", self.pub78, "--revocation", self.revocation,
-                      "--bmf-file", self.bmf])
+        rc = cc.main([src, "-o", out, "--bmf-file", self.bmf] + self.local())
         self.assertEqual(rc, 0)
         with open(out, encoding="utf-8", newline="") as fh:
             rows = list(csv.DictReader(fh))
         self.assertEqual([r["irs_status"] for r in rows], ["eligible", "revoked"])
         self.assertEqual(rows[0]["Amount"], "500")
         self.assertTrue(rows[0]["irs_checked_on"])
+        self.assertIn("irs_990n_terminated", rows[0])
 
     def test_loose_eins_json(self):
         out = os.path.join(self.tmp.name, "out.json")
-        cc.main(["53-0196605", "999999999", "--json", "-o", out, "--pub78", self.pub78,
-                 "--revocation", self.revocation])
+        cc.main(["53-0196605", "999999999", "--json", "-o", out] + self.local())
         with open(out, encoding="utf-8") as fh:
             data = json.load(fh)
         self.assertEqual([d["irs_status"] for d in data], ["eligible", "not_found"])
@@ -194,7 +271,88 @@ class TestMain(Fixture):
 
     def test_missing_file(self):
         with self.assertRaises(SystemExit):
-            cc.main(["no-such-file.csv", "--pub78", self.pub78, "--revocation", self.revocation])
+            cc.main(["no-such-file.csv"] + self.local())
+
+    def test_fail_on_exit_codes(self):
+        out = os.path.join(self.tmp.name, "out.csv")
+        self.assertEqual(cc.main(["53-0196605", "444444444", "-o", out, "--fail-on", "revoked"]
+                                 + self.local()), 1)
+        self.assertEqual(cc.main(["53-0196605", "-o", out, "--fail-on", "revoked,review"]
+                                 + self.local()), 0)
+        self.assertEqual(cc.main(["333333333", "-o", out, "--fail-on", "terminated_990n",
+                                  "--epostcard-file", self.epostcard] + self.local()), 1)
+        with self.assertRaises(SystemExit):
+            cc.main(["53-0196605", "-o", out, "--fail-on", "nope"] + self.local())
+
+    def test_html_report(self):
+        out = os.path.join(self.tmp.name, "out.csv")
+        report = os.path.join(self.tmp.name, "report.html")
+        rc = cc.main(["53-0196605", "777777777", "444444444", "-o", out, "--html", report,
+                      "--epostcard-file", self.epostcard] + self.local())
+        self.assertEqual(rc, 0)
+        with open(report, encoding="utf-8") as fh:
+            page = fh.read()
+        self.assertTrue(page.startswith("<!doctype html>"))
+        self.assertIn("Smith &amp; Jones &lt;Club&gt;", page)
+        self.assertNotIn("<Club>", page)
+        self.assertIn("Rows that need a look (2)", page)
+        self.assertIn("Form 990-N e-Postcard", page)
+        self.assertIn("charity-check " + cc.__version__, page)
+
+    def test_markdown_summary_appends(self):
+        out = os.path.join(self.tmp.name, "out.csv")
+        summary = self.path("summary.md", "earlier step\n")
+        cc.main(["53-0196605", "444444444", "-o", out, "--summary", summary] + self.local())
+        with open(summary, encoding="utf-8") as fh:
+            text = fh.read()
+        self.assertTrue(text.startswith("earlier step\n"))
+        self.assertIn("### charity-check: 2 rows", text)
+        self.assertIn("| revoked | 1 |", text)
+        self.assertIn("| 2 | 44-4444444 | Gone Charity | revoked |", text)
+
+
+@unittest.skipUnless(os.environ.get("CHARITY_CHECK_LIVE"), "set CHARITY_CHECK_LIVE=1 to test against the live IRS files")
+class TestLiveIRS(unittest.TestCase):
+    """Downloads the real IRS files (tens of MB) and checks that the formats still parse."""
+
+    def test_red_cross(self):
+        with tempfile.TemporaryDirectory() as d:
+            out = os.path.join(d, "out.json")
+            cc.main(["53-0196605", "--json", "-o", out, "--990n", "--data-dir", d])
+            with open(out, encoding="utf-8") as fh:
+                r = json.load(fh)[0]
+        self.assertEqual(r["irs_status"], "eligible")
+        self.assertIn("PC", r["irs_pub78_code"])
+        self.assertIn("RED CROSS", r["irs_name"].upper())
+
+    def test_revocation_file_has_dates(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = cc.download(cc.REVOCATION_URL, os.path.join(d, "revocation.zip"))
+            seen = 0
+            for line in cc.iter_lines(path):
+                parts = line.rstrip("\r\n").split("|")
+                self.assertGreaterEqual(len(parts), 10, line)
+                self.assertRegex(cc.parse_irs_date(parts[9]), r"^\d{4}-\d{2}-\d{2}$", line)
+                seen += 1
+                if seen >= 200:
+                    break
+        self.assertEqual(seen, 200)
+
+    def test_epostcard_file_layout(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = cc.download(cc.EPOSTCARD_URL, os.path.join(d, "epostcard.zip"))
+            seen = 0
+            for line in cc.iter_lines(path):
+                parts = line.rstrip("\r\n").split("|")
+                if not parts[0].strip().isdigit():
+                    continue
+                self.assertGreaterEqual(len(parts), 23, line)
+                self.assertRegex(parts[1].strip(), r"^\d{4}", line)
+                self.assertIn(parts[4].strip().upper(), ("T", "F", "Y", "N", ""), line)
+                seen += 1
+                if seen >= 200:
+                    break
+        self.assertEqual(seen, 200)
 
 
 if __name__ == "__main__":

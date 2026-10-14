@@ -1,0 +1,54 @@
+name: charity-check IRS status
+description: Check a CSV of U.S. nonprofits (by EIN) against IRS Publication 78, the auto-revocation list and, optionally, the EO BMF and 990-N e-Postcard file.
+author: MV2 of Munim, Inc.
+branding:
+  icon: check-circle
+  color: green
+inputs:
+  file:
+    description: CSV with an EIN column, or a text file with one EIN per line
+    required: true
+  fail-on:
+    description: Comma-separated statuses or flags that fail the step; empty never fails
+    required: false
+    default: revoked,review,invalid_ein
+  bmf:
+    description: Also search the EO Business Master File (true or false)
+    required: false
+    default: "false"
+  epostcard:
+    description: Also check the 990-N e-Postcard file for organizations that say they have terminated (true or false)
+    required: false
+    default: "false"
+  column:
+    description: Name of the EIN column if it is not detected
+    required: false
+    default: ""
+  output:
+    description: Where to write the checked CSV
+    required: false
+    default: charity-check.csv
+  html:
+    description: Where to write the HTML report
+    required: false
+    default: charity-check.html
+runs:
+  using: composite
+  steps:
+    - name: Check EINs against IRS files
+      shell: bash
+      env:
+        CC_FILE: ${{ inputs.file }}
+        CC_FAIL_ON: ${{ inputs.fail-on }}
+        CC_BMF: ${{ inputs.bmf }}
+        CC_EPOSTCARD: ${{ inputs.epostcard }}
+        CC_COLUMN: ${{ inputs.column }}
+        CC_OUTPUT: ${{ inputs.output }}
+        CC_HTML: ${{ inputs.html }}
+      run: |
+        args=("$CC_FILE" -o "$CC_OUTPUT" --html "$CC_HTML" --summary "$GITHUB_STEP_SUMMARY")
+        if [ "$CC_BMF" = "true" ]; then args+=(--bmf); fi
+        if [ "$CC_EPOSTCARD" = "true" ]; then args+=(--990n); fi
+        if [ -n "$CC_COLUMN" ]; then args+=(--column "$CC_COLUMN"); fi
+        if [ -n "$CC_FAIL_ON" ]; then args+=(--fail-on "$CC_FAIL_ON"); fi
+        python3 "$GITHUB_ACTION_PATH/charity_check.py" "${args[@]}"
