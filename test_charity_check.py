@@ -1,6 +1,7 @@
 import csv
 import json
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -16,6 +17,7 @@ PUB78 = """530196605|American National Red Cross|Washington|DC|United States|PC
 012345678|Small Supporting Org|Boston|MA|United States|SONFI
 222222222|Both Lists Org|Austin|TX|United States|PC
 333333333|Reinstated Org|Denver|CO|United States|PC
+880000000|General Council of Example Churches|Springfield|MO|United States|GROUP
 not-an-ein|Broken Line|X|XX|United States|PC
 """
 
@@ -28,6 +30,10 @@ BMF = """EIN,NAME,ICO,STREET,CITY,STATE,ZIP,GROUP,SUBSECTION,AFFILIATION,CLASSIF
 555555555,GRACE COMMUNITY CHURCH,,9 PINE ST,SALEM,OR,97301-0000,1234,03,9,7000,195501,1,10,001000000,1,01,,0,0,06,0,12,,,,X20,
 666666666,NEIGHBORS FOR PARKS,,4 BIRCH AVE,TOPEKA,KS,66603-0000,0000,04,3,1000,200301,2,00,000000000,1,01,202312,2,2,01,0,12,30000,40000,40000,S20,
 530196605,AMERICAN NATIONAL RED CROSS,,431 18TH ST NW,WASHINGTON,DC,20006-5310,0000,03,3,1000,194602,1,13,000000000,1,01,202306,9,9,01,0,06,1,1,1,P20,
+880000000,GENERAL COUNCIL OF EXAMPLE CHURCHES,,1 CHAPEL RD,SPRINGFIELD,MO,65802-0000,1234,03,8,7000,194501,1,10,001000000,1,01,,0,0,06,0,12,,,,X20,
+909090909,"NATIONAL LEAGUE OF PARK FRIENDS, INC",,5 ELM ST,DAYTON,OH,45402-0000,0927,03,6,1000,196001,1,15,000000000,1,01,202312,5,5,01,0,12,1,1,1,C30,
+101010101,PARK FRIENDS OF DAYTON,,6 ELM ST,DAYTON,OH,45402-0000,0927,03,7,1000,201001,1,15,000000000,1,01,202312,2,2,01,0,12,1,1,1,C30,
+121212121,LOST GROUP CHAPTER,,7 ELM ST,DAYTON,OH,45402-0000,4321,03,9,1000,201001,1,15,000000000,1,01,202312,2,2,01,0,12,1,1,1,C30,
 """
 
 
@@ -92,6 +98,12 @@ class TestNormalize(unittest.TestCase):
     def test_format(self):
         self.assertEqual(cc.format_ein("131623829"), "13-1623829")
 
+    def test_group_key(self):
+        self.assertEqual(cc.group_key("0927"), "927")
+        self.assertEqual(cc.group_key(" 1234 "), "1234")
+        self.assertEqual(cc.group_key("0000"), "")
+        self.assertEqual(cc.group_key(None), "")
+
 
 class TestDates(unittest.TestCase):
     def test_parse(self):
@@ -126,6 +138,15 @@ class TestLoaders(Fixture):
         self.assertEqual(got["555555555"]["FOUNDATION"], "10")
         self.assertEqual(got["666666666"]["SUBSECTION"], "04")
 
+    def test_bmf_collects_group_centrals(self):
+        centrals = {}
+        got = cc.load_bmf([self.bmf], {"101010101"}, centrals)
+        self.assertEqual(set(got), {"101010101"})
+        self.assertEqual(centrals, {
+            "1234": {"ein": "880000000", "name": "GENERAL COUNCIL OF EXAMPLE CHURCHES"},
+            "927": {"ein": "909090909", "name": "NATIONAL LEAGUE OF PARK FRIENDS, INC"},
+        })
+
     def test_epostcard_keeps_latest_year(self):
         got = cc.load_epostcard(self.epostcard, {"333333333", "777777777", "999999999"})
         self.assertEqual(set(got), {"333333333", "777777777"})
@@ -150,6 +171,7 @@ class TestAssess(Fixture):
         self.assertEqual(r["53-0196605"]["ein_9"], "53-0196605")
         self.assertEqual(r["53-0196605"]["irs_foundation_code"], "13")
         self.assertEqual(r["53-0196605"]["irs_subsection"], "501(c)(3)")
+        self.assertEqual(r["53-0196605"]["irs_group_exemption"], "")
         self.assertEqual(r["131623829"]["irs_status"], "eligible")
         self.assertIn("private_foundation", r["131623829"]["irs_flags"])
         self.assertIn("expenditure responsibility", r["131623829"]["irs_note"])
@@ -171,6 +193,39 @@ class TestAssess(Fixture):
         self.assertEqual(r["999999999"]["irs_status"], "not_found")
         self.assertIn("Business Master File", r["999999999"]["irs_note"])
         self.assertEqual(r["garbage"]["irs_status"], "invalid_ein")
+
+    def test_group_subordinate_names_listed_central(self):
+        r = self.run_check(["555555555"])["555555555"]
+        self.assertEqual(r["irs_group_exemption"], "1234")
+        self.assertEqual(r["irs_group_central_ein"], "88-0000000")
+        self.assertEqual(r["irs_group_central_name"], "GENERAL COUNCIL OF EXAMPLE CHURCHES")
+        self.assertIn("listed in Publication 78 (code GROUP)", r["irs_note"])
+        self.assertNotIn("group_central_unconfirmed", r["irs_flags"])
+
+    def test_group_central_not_in_pub78(self):
+        r = self.run_check(["101010101"])["101010101"]
+        self.assertEqual(r["irs_status"], "listed_bmf_not_pub78")
+        self.assertEqual(r["irs_group_exemption"], "0927")
+        self.assertEqual(r["irs_group_central_ein"], "90-9090909")
+        self.assertIn("group_subordinate", r["irs_flags"])
+        self.assertIn("group_central_unconfirmed", r["irs_flags"])
+        self.assertIn("not in Publication 78", r["irs_note"])
+        self.assertIn("NATIONAL LEAGUE OF PARK FRIENDS, INC", r["irs_note"])
+
+    def test_group_central_missing(self):
+        r = self.run_check(["121212121"])["121212121"]
+        self.assertEqual(r["irs_group_exemption"], "4321")
+        self.assertEqual(r["irs_group_central_ein"], "")
+        self.assertIn("No organization holding group exemption 4321", r["irs_note"])
+        self.assertNotIn("group_central_unconfirmed", r["irs_flags"])
+
+    def test_group_central_revoked(self):
+        rev = self.path("rev-central.txt", REVOCATION +
+                        "880000000|General Council of Example Churches||1 Chapel Rd|Springfield|MO|65802|US|"
+                        "501(c)(3)|15-MAY-2024|10-AUG-2024|\n")
+        r = cc.check(["555555555"], self.pub78, rev, [self.bmf])["555555555"]
+        self.assertIn("group_central_unconfirmed", r["irs_flags"])
+        self.assertIn("automatically revoked 2024-05-15", r["irs_note"])
 
     def test_not_found_without_bmf_suggests_flag(self):
         r = self.run_check(["555555555"], bmf=False)
@@ -237,6 +292,7 @@ class TestFailOn(unittest.TestCase):
     def test_parse(self):
         self.assertEqual(cc.parse_fail_on("revoked, review;terminated_990n"),
                          ["revoked", "review", "terminated_990n"])
+        self.assertEqual(cc.parse_fail_on("group_central_unconfirmed"), ["group_central_unconfirmed"])
         self.assertEqual(cc.parse_fail_on(""), [])
         with self.assertRaises(SystemExit):
             cc.parse_fail_on("revoked,bogus")
@@ -250,16 +306,18 @@ class TestFailOn(unittest.TestCase):
 
 class TestMain(Fixture):
     def test_csv_end_to_end(self):
-        src = self.path("grantees.csv", "Grantee,EIN,Amount\nRed Cross,53-0196605,500\nGone,444444444,250\n")
+        src = self.path("grantees.csv", "Grantee,EIN,Amount\nRed Cross,53-0196605,500\nGone,444444444,250\n"
+                                        "Park Friends,101010101,75\n")
         out = os.path.join(self.tmp.name, "out.csv")
         rc = cc.main([src, "-o", out, "--bmf-file", self.bmf] + self.local())
         self.assertEqual(rc, 0)
         with open(out, encoding="utf-8", newline="") as fh:
             rows = list(csv.DictReader(fh))
-        self.assertEqual([r["irs_status"] for r in rows], ["eligible", "revoked"])
+        self.assertEqual([r["irs_status"] for r in rows], ["eligible", "revoked", "listed_bmf_not_pub78"])
         self.assertEqual(rows[0]["Amount"], "500")
         self.assertTrue(rows[0]["irs_checked_on"])
         self.assertIn("irs_990n_terminated", rows[0])
+        self.assertEqual(rows[2]["irs_group_central_name"], "NATIONAL LEAGUE OF PARK FRIENDS, INC")
 
     def test_loose_eins_json(self):
         out = os.path.join(self.tmp.name, "out.json")
@@ -281,6 +339,8 @@ class TestMain(Fixture):
                                  + self.local()), 0)
         self.assertEqual(cc.main(["333333333", "-o", out, "--fail-on", "terminated_990n",
                                   "--epostcard-file", self.epostcard] + self.local()), 1)
+        self.assertEqual(cc.main(["101010101", "-o", out, "--fail-on", "group_central_unconfirmed",
+                                  "--bmf-file", self.bmf] + self.local()), 1)
         with self.assertRaises(SystemExit):
             cc.main(["53-0196605", "-o", out, "--fail-on", "nope"] + self.local())
 
@@ -309,6 +369,67 @@ class TestMain(Fixture):
         self.assertIn("### charity-check: 2 rows", text)
         self.assertIn("| revoked | 1 |", text)
         self.assertIn("| 2 | 44-4444444 | Gone Charity | revoked |", text)
+
+
+def find_web_page():
+    for p in (os.path.join(HERE, "docs", "index.html"), os.path.join(HERE, "index.html")):
+        if os.path.exists(p):
+            return p
+    return None
+
+
+WEB_PAGE = find_web_page()
+
+
+@unittest.skipUnless(WEB_PAGE, "docs/index.html is not next to the tests")
+class TestWebPage(unittest.TestCase):
+    """The browser version (docs/index.html) must use the same codes, statuses and columns."""
+
+    @classmethod
+    def setUpClass(cls):
+        with open(WEB_PAGE, encoding="utf-8") as fh:
+            cls.page = fh.read()
+
+    def js_object(self, name):
+        m = re.search(r"const %s = \{(.*?)\};" % name, self.page, re.S)
+        self.assertIsNotNone(m, name)
+        return dict(re.findall(r"'([A-Za-z0-9_]+)':\s*'([^']*)'", m.group(1)))
+
+    def js_list(self, name):
+        m = re.search(r"const %s = \[(.*?)\];" % name, self.page, re.S)
+        self.assertIsNotNone(m, name)
+        return re.findall(r"'([^']*)'", m.group(1))
+
+    def test_same_version(self):
+        self.assertIn("const VERSION = '%s';" % cc.__version__, self.page)
+
+    def test_same_tables(self):
+        self.assertEqual(self.js_object("PUB78_CODES"), cc.PUB78_CODES)
+        self.assertEqual(self.js_object("PUB78_FLAGS"), cc.PUB78_FLAGS)
+        self.assertEqual(self.js_object("FOUNDATION_CODES"), cc.FOUNDATION_CODES)
+        self.assertEqual(self.js_object("DEDUCTIBILITY_CODES"), cc.DEDUCTIBILITY_CODES)
+        self.assertEqual(self.js_list("STATUSES"), list(cc.STATUSES))
+        self.assertEqual(self.js_list("OUTPUT_FIELDS"), list(cc.OUTPUT_FIELDS))
+        self.assertEqual(self.js_list("OTHER_FLAGS"), list(cc.OTHER_FLAGS))
+        self.assertEqual(self.js_list("BMF_FIELDS"), list(cc.BMF_FIELDS))
+        self.assertEqual(self.js_list("GROUP_PARENT_CODES"), list(cc.GROUP_PARENT_CODES))
+        self.assertEqual(self.js_list("GROUP_MEMBER_CODES"), list(cc.GROUP_MEMBER_CODES))
+
+    def test_makes_no_network_requests(self):
+        csp = re.search(r'<meta http-equiv="Content-Security-Policy" content="([^"]+)"', self.page)
+        self.assertIsNotNone(csp)
+        self.assertIn("default-src 'none'", csp.group(1))
+        self.assertNotIn("connect-src", csp.group(1))
+        self.assertNotRegex(self.page, r"<script[^>]+src=")
+        self.assertNotRegex(self.page, r"<link[^>]+stylesheet")
+        for call in ("fetch(", "XMLHttpRequest", "WebSocket", "sendBeacon", "EventSource"):
+            self.assertNotIn(call, self.page)
+
+    def test_scripts_are_balanced(self):
+        script = self.page.split("<script>", 1)[1].split("</script>", 1)[0]
+        code = re.sub(r"//[^\n]*", "", re.sub(r"'(\\.|[^'\\\n])*'|\"(\\.|[^\"\\\n])*\"|/(\\.|[^/\\\n])+/[gimsuy]*", "''", script))
+        for a, b in ("()", "[]", "{}"):
+            self.assertEqual(code.count(a), code.count(b), a + b)
 
 
 @unittest.skipUnless(os.environ.get("CHARITY_CHECK_LIVE"), "set CHARITY_CHECK_LIVE=1 to test against the live IRS files")

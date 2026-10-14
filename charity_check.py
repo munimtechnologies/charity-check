@@ -24,7 +24,7 @@ import zipfile
 from datetime import date, datetime, timezone
 from html import escape
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 PUB78_URL = "https://apps.irs.gov/pub/epostcard/data-download-pub78.zip"
 REVOCATION_URL = "https://apps.irs.gov/pub/epostcard/data-download-revocation.zip"
@@ -64,7 +64,8 @@ PUB78_FLAGS = {
     "SOUNK": "supporting_org_type_unknown",
 }
 
-OTHER_FLAGS = ("reinstated_after_revocation", "church", "group_subordinate", "terminated_990n")
+OTHER_FLAGS = ("reinstated_after_revocation", "church", "group_subordinate", "terminated_990n",
+               "group_central_unconfirmed")
 
 # EO BMF foundation codes (IRS eo-info.pdf).
 FOUNDATION_CODES = {
@@ -91,6 +92,10 @@ FOUNDATION_CODES = {
 
 DEDUCTIBILITY_CODES = {"1": "yes", "2": "no", "4": "yes"}
 
+# EO BMF affiliation codes: 6 and 8 hold a group exemption, 7 and 9 are covered by one.
+GROUP_PARENT_CODES = ("6", "8")
+GROUP_MEMBER_CODES = ("7", "9")
+
 BMF_FIELDS = ("NAME", "CITY", "STATE", "GROUP", "SUBSECTION", "AFFILIATION",
               "RULING", "DEDUCTIBILITY", "FOUNDATION", "STATUS", "NTEE_CD")
 
@@ -99,7 +104,8 @@ OUTPUT_FIELDS = (
     "irs_name", "irs_city", "irs_state", "irs_revocation_date",
     "irs_reinstatement_date", "irs_subsection", "irs_foundation_code",
     "irs_foundation_meaning", "irs_ruling", "irs_ntee", "irs_990n_tax_year",
-    "irs_990n_terminated", "irs_flags", "irs_note",
+    "irs_990n_terminated", "irs_group_exemption", "irs_group_central_ein",
+    "irs_group_central_name", "irs_flags", "irs_note",
 )
 
 STATUSES = ("eligible", "listed_bmf_not_pub78", "exempt_not_501c3", "revoked",
@@ -138,6 +144,11 @@ def normalize_ein(raw):
 
 def format_ein(ein9):
     return "%s-%s" % (ein9[:2], ein9[2:]) if ein9 else ""
+
+
+def group_key(gen):
+    """Group exemption number as a lookup key: '0927' -> '927'; '' and '0000' -> ''."""
+    return (gen or "").strip().lstrip("0")
 
 
 def parse_irs_date(raw):
@@ -258,8 +269,12 @@ def load_epostcard(path, wanted):
     return found
 
 
-def load_bmf(paths, wanted):
-    """EO BMF CSV files (with header row) -> {ein: {field: value}} for wanted EINs."""
+def load_bmf(paths, wanted, centrals=None):
+    """EO BMF CSV files (with header row) -> {ein: {field: value}} for wanted EINs.
+
+    If centrals is a dict, it is filled with {group key: {"ein", "name"}} for every
+    organization that holds a group exemption (affiliation code 6 or 8).
+    """
     found = {}
     for path in paths:
         reader = csv.DictReader(iter_lines(path))
@@ -270,6 +285,10 @@ def load_bmf(paths, wanted):
             ein = ein.zfill(9)
             if ein in wanted and ein not in found:
                 found[ein] = {k: (row.get(k) or "").strip() for k in BMF_FIELDS}
+            if centrals is not None and (row.get("AFFILIATION") or "").strip() in GROUP_PARENT_CODES:
+                gen = group_key(row.get("GROUP"))
+                if gen and gen not in centrals:
+                    centrals[gen] = {"ein": ein, "name": (row.get("NAME") or "").strip()}
     return found
 
 
@@ -279,7 +298,27 @@ def latest_revocation(records):
     return max(records, key=lambda r: (r["revocation_date"], r["posting_date"]))
 
 
-def assess(ein, pub78, revocations, bmf, bmf_checked=False, epostcard=None):
+def group_central_note(b, central, pub78, revocations, flags):
+    """Name the organization that holds a subordinate's group exemption and say how it is listed."""
+    if not central:
+        return ("No organization holding group exemption %s was found in the Business Master File "
+                "searched." % b["GROUP"])
+    held = "Group exemption %s is held by %s (EIN %s)" % (b["GROUP"], central["name"],
+                                                          format_ein(central["ein"]))
+    cp = pub78.get(central["ein"])
+    crev = latest_revocation(revocations.get(central["ein"]))
+    if crev and not crev["reinstatement_date"]:
+        flags.append("group_central_unconfirmed")
+        return ("%s, whose own exemption was automatically revoked %s; ask the organization for a "
+                "current group exemption letter." % (held, crev["revocation_date"]))
+    if cp:
+        return "%s, which is listed in Publication 78 (code %s)." % (held, ",".join(cp["codes"]))
+    flags.append("group_central_unconfirmed")
+    return ("%s, which is not in Publication 78; ask the organization for the central organization's "
+            "group exemption letter and proof that it is included in the group." % held)
+
+
+def assess(ein, pub78, revocations, bmf, bmf_checked=False, epostcard=None, centrals=None):
     """Return the irs_* columns for one EIN."""
     out = dict.fromkeys(OUTPUT_FIELDS, "")
     if ein is None:
@@ -294,6 +333,7 @@ def assess(ein, pub78, revocations, bmf, bmf_checked=False, epostcard=None):
     b = bmf.get(ein)
     n = (epostcard or {}).get(ein)
     revoked_now = bool(rev) and not rev["reinstatement_date"]
+    group_note = ""
 
     if p:
         out["irs_pub78_code"] = ",".join(p["codes"])
@@ -320,8 +360,15 @@ def assess(ein, pub78, revocations, bmf, bmf_checked=False, epostcard=None):
             out["irs_name"], out["irs_city"], out["irs_state"] = b["NAME"], b["CITY"], b["STATE"]
         if b["FOUNDATION"] == "10":
             flags.append("church")
-        if b["AFFILIATION"] == "9" and b["GROUP"].strip("0"):
+        gen = group_key(b["GROUP"])
+        if b["AFFILIATION"] in GROUP_MEMBER_CODES and gen:
             flags.append("group_subordinate")
+            out["irs_group_exemption"] = b["GROUP"]
+            central = (centrals or {}).get(gen)
+            if central:
+                out["irs_group_central_ein"] = format_ein(central["ein"])
+                out["irs_group_central_name"] = central["name"]
+            group_note = group_central_note(b, central, pub78, revocations, flags)
     if n:
         out["irs_990n_tax_year"] = n["tax_year"]
         out["irs_990n_terminated"] = "yes" if n["terminated"] else "no"
@@ -371,6 +418,8 @@ def assess(ein, pub78, revocations, bmf, bmf_checked=False, epostcard=None):
             out["irs_note"] += " It did file a 990-N e-Postcard for tax year %s." % (n["tax_year"] or "unknown")
         if not bmf_checked:
             out["irs_note"] += " Re-run with --bmf to also search the Business Master File."
+    if group_note:
+        out["irs_note"] += " " + group_note
 
     if n and n["terminated"]:
         said = ("Its latest 990-N e-Postcard (tax year %s) says the organization has terminated."
@@ -482,11 +531,18 @@ def check(eins, pub78_path, revocation_path, bmf_paths=(), epostcard_path=None):
     """Assess an iterable of raw EIN strings. Returns {raw: irs_* dict}."""
     normalized = {raw: normalize_ein(raw) for raw in eins}
     wanted = {e for e in normalized.values() if e}
-    pub78 = load_pub78(pub78_path, wanted)
-    revocations = load_revocations(revocation_path, wanted)
-    bmf = load_bmf(bmf_paths, wanted) if bmf_paths else {}
+    centrals = {}
+    bmf = load_bmf(bmf_paths, wanted, centrals) if bmf_paths else {}
+    # Also look up the organization holding each subordinate's group exemption.
+    lookup = set(wanted)
+    for b in bmf.values():
+        gen = group_key(b["GROUP"])
+        if b["AFFILIATION"] in GROUP_MEMBER_CODES and gen in centrals:
+            lookup.add(centrals[gen]["ein"])
+    pub78 = load_pub78(pub78_path, lookup)
+    revocations = load_revocations(revocation_path, lookup)
     epostcard = load_epostcard(epostcard_path, wanted) if epostcard_path else {}
-    return {raw: assess(e, pub78, revocations, bmf, bool(bmf_paths), epostcard)
+    return {raw: assess(e, pub78, revocations, bmf, bool(bmf_paths), epostcard, centrals)
             for raw, e in normalized.items()}
 
 
@@ -605,7 +661,8 @@ def build_parser():
                          "(comma-separated, e.g. revoked,review,terminated_990n)")
     ap.add_argument("--column", help="name of the EIN column if it is not detected")
     ap.add_argument("--bmf", action="store_true",
-                    help="also download and search the EO Business Master File (about 1.9M rows)")
+                    help="also download and search the EO Business Master File (about 1.9M rows); "
+                         "names the organization holding each subordinate's group exemption")
     ap.add_argument("--990n", dest="use_990n", action="store_true",
                     help="also download the Form 990-N e-Postcard file and flag organizations "
                          "whose latest e-Postcard says they have terminated")

@@ -1,0 +1,849 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Check a list of U.S. nonprofits by EIN against IRS Publication 78, the auto-revocation list, the 990-N e-Postcard file and the Business Master File, in your browser. Nothing is uploaded.">
+<title>charity-check: bulk IRS status check for U.S. nonprofits, in your browser</title>
+<style>
+body{font:15px/1.5 system-ui,sans-serif;margin:0 auto;max-width:1100px;padding:1.5em;color:#222}
+h1{margin-bottom:.2em}h2{margin-top:1.6em}
+.lead{font-size:1.05em;color:#333}
+fieldset{border:1px solid #ccc;border-radius:6px;margin:1em 0;padding:.8em 1em}
+legend{font-weight:600;padding:0 .4em}
+textarea{width:100%;box-sizing:border-box;min-height:7em;font:13px/1.4 ui-monospace,monospace}
+label{display:block;margin:.5em 0 .2em}
+.hint,small{color:#666}
+button{font:inherit;padding:.45em 1.1em;margin:.3em .4em .3em 0;cursor:pointer}
+#run{font-weight:600}
+#status{margin:.6em 0;min-height:1.5em}
+.error{color:#a40000;font-weight:600}
+table{border-collapse:collapse;margin:1em 0;font-size:13px}
+th,td{border:1px solid #ccc;padding:4px 8px;text-align:left;vertical-align:top}
+th{background:#f3f3f3}
+.s{padding:1px 6px;border-radius:3px;white-space:nowrap}
+.eligible{background:#dff3df}.revoked,.invalid_ein{background:#f8d7d7}.review{background:#fde9c4}
+.not_found,.listed_bmf_not_pub78,.exempt_not_501c3{background:#e6ecf5}
+footer{margin-top:3em;font-size:13px;color:#555}
+@media print{.noprint,fieldset,#controls{display:none}body{max-width:none;padding:0}}
+</style>
+</head>
+<body>
+<h1>charity-check</h1>
+<p class="lead">Check a whole list of U.S. nonprofits against the IRS's own files: Publication 78,
+the automatic-revocation list, and optionally the Form 990-N e-Postcard file and the Business
+Master File. Free, and private: this page runs entirely in your browser and is not allowed to
+make network requests (see its Content-Security-Policy), so your list and the IRS files never
+leave this computer.</p>
+
+<div id="controls">
+<fieldset>
+<legend>1. Your list</legend>
+<label for="list">Paste EINs (one per line) or a CSV with an EIN column:</label>
+<textarea id="list" spellcheck="false" placeholder="53-0196605&#10;13-1623829"></textarea>
+<label for="listFile">...or choose a CSV or text file:</label>
+<input type="file" id="listFile" accept=".csv,.txt,.tsv,text/csv,text/plain">
+<label for="column">EIN column name (only if it is not found automatically):</label>
+<input type="text" id="column" size="24">
+<p class="hint">Columns named EIN, FEIN, TIN, Tax ID or Employer Identification Number are found
+automatically. 53-0196605, 530196605 and spreadsheet-mangled 530196605.0 or 12345678 all work.
+Save Excel sheets as CSV first.</p>
+</fieldset>
+
+<fieldset>
+<legend>2. IRS files (download them, then choose them here)</legend>
+<p class="hint">Your browser cannot fetch these for you, so download each one from the IRS
+(links below) and pick the saved file. Zip files can be used as they are. The IRS updates them
+monthly; see the <a href="https://www.irs.gov/charities-non-profits/tax-exempt-organization-search-bulk-data-downloads" rel="noopener">IRS bulk data page</a>.</p>
+<label for="pub78File">Publication 78 (required):
+<a href="https://apps.irs.gov/pub/epostcard/data-download-pub78.zip" rel="noopener">data-download-pub78.zip</a></label>
+<input type="file" id="pub78File" accept=".zip,.txt">
+<label for="revFile">Automatic revocation list (required):
+<a href="https://apps.irs.gov/pub/epostcard/data-download-revocation.zip" rel="noopener">data-download-revocation.zip</a></label>
+<input type="file" id="revFile" accept=".zip,.txt">
+<label for="n990File">Form 990-N e-Postcard (optional; flags small organizations that say they have shut down):
+<a href="https://apps.irs.gov/pub/epostcard/data-download-epostcard.zip" rel="noopener">data-download-epostcard.zip</a></label>
+<input type="file" id="n990File" accept=".zip,.txt">
+<label for="bmfFiles">EO Business Master File (optional; finds churches, group-exemption subordinates and their
+central organization, and non-501(c)(3) exempt groups). Choose all four:
+<a href="https://www.irs.gov/pub/irs-soi/eo1.csv" rel="noopener">eo1.csv</a>,
+<a href="https://www.irs.gov/pub/irs-soi/eo2.csv" rel="noopener">eo2.csv</a>,
+<a href="https://www.irs.gov/pub/irs-soi/eo3.csv" rel="noopener">eo3.csv</a>,
+<a href="https://www.irs.gov/pub/irs-soi/eo4.csv" rel="noopener">eo4.csv</a></label>
+<input type="file" id="bmfFiles" accept=".csv,.zip" multiple>
+</fieldset>
+
+<button id="run" type="button">Check my list</button>
+<div id="status" role="status" aria-live="polite"></div>
+</div>
+
+<div id="results"></div>
+
+<footer>
+<p>Information from public IRS data, not legal or tax advice. IRS files lag by weeks; confirm large
+or unusual grants in <a href="https://apps.irs.gov/app/eos/" rel="noopener">IRS TEOS</a>.
+Rev. Proc. 2011-33 describes when grantors may rely on Publication 78 or the Business Master File.</p>
+<p>charity-check <span id="version"></span> by MV2 of Munim, Inc., made with AI agents. MIT license.
+Source, a command-line version and a GitHub Action:
+<a href="https://github.com/munimv2/charity-check" rel="noopener">github.com/munimv2/charity-check</a>.
+If your organization uses it, an issue saying so (and what would make it more useful) helps a lot.</p>
+</footer>
+
+<script>
+'use strict';
+
+// charity-check in the browser: the same checks as charity_check.py, on files you choose.
+// MV2 of Munim, Inc. - MIT license.
+
+const VERSION = '0.3.0';
+const TEOS_URL = 'https://apps.irs.gov/app/eos/';
+
+const PUB78_CODES = {
+  'PC': 'Public charity',
+  'POF': 'Private operating foundation',
+  'PF': 'Private foundation',
+  'GROUP': 'Central organization holding a group exemption (subordinates not listed separately)',
+  'LODGE': 'Domestic fraternal society under the lodge system (gifts for charitable use only)',
+  'UNKWN': 'Charitable organization whose public charity status has not been determined',
+  'EO': 'Section 170(c) organization other than a public charity or private foundation',
+  'FED': 'Deductible if made for the use of a federal governmental unit',
+  'FORGN': 'Foreign-addressed organization',
+  'SO': 'Type I, Type II or functionally integrated Type III supporting organization',
+  'SONFI': 'Non-functionally integrated Type III supporting organization',
+  'SOUNK': 'Supporting organization, type unspecified',
+};
+
+const PUB78_FLAGS = {
+  'PF': 'private_foundation',
+  'POF': 'private_operating_foundation',
+  'GROUP': 'group_exemption_central',
+  'LODGE': 'lodge_charitable_use_only',
+  'UNKWN': 'public_charity_status_undetermined',
+  'EO': 'other_170c_organization',
+  'FED': 'federal_unit_use_only',
+  'FORGN': 'foreign_address',
+  'SONFI': 'type3_non_functionally_integrated',
+  'SOUNK': 'supporting_org_type_unknown',
+};
+
+const OTHER_FLAGS = ['reinstated_after_revocation', 'church', 'group_subordinate', 'terminated_990n',
+  'group_central_unconfirmed'];
+
+const FOUNDATION_CODES = {
+  '00': 'All organizations except 501(c)(3)',
+  '02': 'Private operating foundation exempt from excise tax on investment income',
+  '03': 'Private operating foundation (other)',
+  '04': 'Private non-operating foundation',
+  '09': 'Suspense',
+  '10': 'Church 170(b)(1)(A)(i)',
+  '11': 'School 170(b)(1)(A)(ii)',
+  '12': 'Hospital or medical research organization 170(b)(1)(A)(iii)',
+  '13': 'Organization supporting a government-owned college or university 170(b)(1)(A)(iv)',
+  '14': 'Governmental unit 170(b)(1)(A)(v)',
+  '15': 'Publicly supported organization 170(b)(1)(A)(vi)',
+  '16': 'Publicly supported organization 509(a)(2)',
+  '17': 'Supporting organization 509(a)(3)',
+  '18': 'Organization that tests for public safety 509(a)(4)',
+  '21': 'Supporting organization 509(a)(3) Type I',
+  '22': 'Supporting organization 509(a)(3) Type II',
+  '23': 'Supporting organization 509(a)(3) Type III functionally integrated',
+  '24': 'Supporting organization 509(a)(3) Type III non-functionally integrated',
+  '25': 'Agricultural research organization 170(b)(1)(A)(ix)',
+};
+
+const DEDUCTIBILITY_CODES = {'1': 'yes', '2': 'no', '4': 'yes'};
+const GROUP_PARENT_CODES = ['6', '8'];
+const GROUP_MEMBER_CODES = ['7', '9'];
+const BMF_FIELDS = ['NAME', 'CITY', 'STATE', 'GROUP', 'SUBSECTION', 'AFFILIATION',
+  'RULING', 'DEDUCTIBILITY', 'FOUNDATION', 'STATUS', 'NTEE_CD'];
+
+const OUTPUT_FIELDS = [
+  'ein_9', 'irs_status', 'irs_deductible', 'irs_pub78_code', 'irs_pub78_meaning',
+  'irs_name', 'irs_city', 'irs_state', 'irs_revocation_date',
+  'irs_reinstatement_date', 'irs_subsection', 'irs_foundation_code',
+  'irs_foundation_meaning', 'irs_ruling', 'irs_ntee', 'irs_990n_tax_year',
+  'irs_990n_terminated', 'irs_group_exemption', 'irs_group_central_ein',
+  'irs_group_central_name', 'irs_flags', 'irs_note',
+];
+
+const STATUSES = ['eligible', 'listed_bmf_not_pub78', 'exempt_not_501c3', 'revoked',
+  'review', 'not_found', 'invalid_ein'];
+
+const MONTHS = {JAN: 1, FEB: 2, MAR: 3, APR: 4, MAY: 5, JUN: 6, JUL: 7, AUG: 8, SEP: 9, OCT: 10, NOV: 11, DEC: 12};
+const EIN_HEADER = /(^|[^a-z])(ein|fein|tin)([^a-z]|$)|tax[ _-]?id|employer identification/;
+const TRUE_VALUES = ['T', 'Y', 'TRUE', 'YES', '1'];
+
+// ---- EINs and dates ----
+
+function normalizeEin(raw) {
+  if (raw === null || raw === undefined) return null;
+  const s = String(raw).trim().replace(/\.0+$/, '');
+  if (!/^[\d\s-]+$/.test(s)) return null;
+  let digits = s.replace(/\D/g, '');
+  if (digits.length < 7 || digits.length > 9) return null;
+  digits = digits.padStart(9, '0');
+  return digits === '000000000' ? null : digits;
+}
+
+function formatEin(ein9) {
+  return ein9 ? ein9.slice(0, 2) + '-' + ein9.slice(2) : '';
+}
+
+function groupKey(gen) {
+  return (gen || '').trim().replace(/^0+/, '');
+}
+
+function pad2(n) {
+  return String(n).padStart(2, '0');
+}
+
+function parseIrsDate(raw) {
+  const s = (raw || '').trim();
+  if (!s) return '';
+  let m = /^(\d{1,2})-([A-Za-z]{3})-(\d{4})$/.exec(s);
+  if (m && MONTHS[m[2].toUpperCase()]) return m[3] + '-' + pad2(MONTHS[m[2].toUpperCase()]) + '-' + pad2(+m[1]);
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+  m = /^(\d{1,2})[\/-](\d{1,2})[\/-](\d{4})$/.exec(s);
+  if (m) return m[3] + '-' + pad2(+m[1]) + '-' + pad2(+m[2]);
+  return s;
+}
+
+// ---- reading big files: plain text, or the largest member of a zip, streamed ----
+
+async function bytesOf(blob, start, end) {
+  return new Uint8Array(await blob.slice(start, end).arrayBuffer());
+}
+
+// Returns {name, method, csize, usize, start} for the largest file in a zip, or null if not a zip.
+async function zipLargestMember(file) {
+  if (file.size < 22) return null;
+  const head = await bytesOf(file, 0, 4);
+  if (new DataView(head.buffer).getUint32(0, true) !== 0x04034b50) return null;
+  const tailStart = Math.max(0, file.size - 22 - 65535);
+  const tail = await bytesOf(file, tailStart, file.size);
+  const dv = new DataView(tail.buffer);
+  let eocd = -1;
+  for (let i = tail.length - 22; i >= 0; i--) {
+    if (dv.getUint32(i, true) === 0x06054b50) { eocd = i; break; }
+  }
+  if (eocd < 0) throw new Error(file.name + ' looks like a zip but has no directory (is the download complete?)');
+  let count = dv.getUint16(eocd + 10, true);
+  let cdSize = dv.getUint32(eocd + 12, true);
+  let cdOffset = dv.getUint32(eocd + 16, true);
+  if (count === 0xffff || cdSize === 0xffffffff || cdOffset === 0xffffffff) {
+    const loc = eocd - 20;
+    if (loc < 0 || dv.getUint32(loc, true) !== 0x07064b50) throw new Error('unsupported zip64 file: ' + file.name);
+    const recOffset = Number(dv.getBigUint64(loc + 8, true));
+    const rec = await bytesOf(file, recOffset, recOffset + 56);
+    const rv = new DataView(rec.buffer);
+    if (rv.getUint32(0, true) !== 0x06064b50) throw new Error('broken zip64 directory: ' + file.name);
+    count = Number(rv.getBigUint64(32, true));
+    cdSize = Number(rv.getBigUint64(40, true));
+    cdOffset = Number(rv.getBigUint64(48, true));
+  }
+  const cd = await bytesOf(file, cdOffset, cdOffset + cdSize);
+  const cv = new DataView(cd.buffer);
+  const names = new TextDecoder();
+  let best = null;
+  let p = 0;
+  for (let n = 0; n < count; n++) {
+    if (p + 46 > cd.length || cv.getUint32(p, true) !== 0x02014b50) throw new Error('broken zip directory: ' + file.name);
+    const method = cv.getUint16(p + 10, true);
+    let csize = cv.getUint32(p + 20, true);
+    let usize = cv.getUint32(p + 24, true);
+    const nameLen = cv.getUint16(p + 28, true);
+    const extraLen = cv.getUint16(p + 30, true);
+    const commentLen = cv.getUint16(p + 32, true);
+    let local = cv.getUint32(p + 42, true);
+    const name = names.decode(cd.subarray(p + 46, p + 46 + nameLen));
+    let e = p + 46 + nameLen;
+    const extraEnd = e + extraLen;
+    while (e + 4 <= extraEnd) {
+      const id = cv.getUint16(e, true);
+      const len = cv.getUint16(e + 2, true);
+      if (id === 0x0001) {
+        let q = e + 4;
+        if (usize === 0xffffffff) { usize = Number(cv.getBigUint64(q, true)); q += 8; }
+        if (csize === 0xffffffff) { csize = Number(cv.getBigUint64(q, true)); q += 8; }
+        if (local === 0xffffffff) { local = Number(cv.getBigUint64(q, true)); q += 8; }
+      }
+      e += 4 + len;
+    }
+    p = extraEnd + commentLen;
+    if (name.endsWith('/') || name.includes('__MACOSX')) continue;
+    if (!best || usize > best.usize) best = {name, method, csize, usize, local};
+  }
+  if (!best) throw new Error('empty zip: ' + file.name);
+  const lh = await bytesOf(file, best.local, best.local + 30);
+  const lv = new DataView(lh.buffer);
+  if (lv.getUint32(0, true) !== 0x04034b50) throw new Error('broken zip entry in ' + file.name);
+  best.start = best.local + 30 + lv.getUint16(26, true) + lv.getUint16(28, true);
+  return best;
+}
+
+// Calls onLine(line) for every line of a text file or of the largest file in a zip.
+async function eachLine(file, onLine, onProgress) {
+  const z = await zipLargestMember(file);
+  let stream;
+  let total;
+  if (z) {
+    stream = file.slice(z.start, z.start + z.csize).stream();
+    if (z.method === 8) stream = stream.pipeThrough(new DecompressionStream('deflate-raw'));
+    else if (z.method !== 0) throw new Error('unsupported zip compression (' + z.method + ') in ' + file.name);
+    total = z.usize;
+  } else {
+    stream = file.stream();
+    total = file.size;
+  }
+  const reader = stream.pipeThrough(new TextDecoderStream('utf-8')).getReader();
+  let rest = '';
+  let seen = 0;
+  let shown = 0;
+  for (;;) {
+    const {value, done} = await reader.read();
+    if (done) break;
+    seen += value.length;
+    const lines = (rest + value).split('\n');
+    rest = lines.pop();
+    for (const line of lines) onLine(line.endsWith('\r') ? line.slice(0, -1) : line);
+    if (onProgress && seen - shown > 8e6) {
+      shown = seen;
+      await onProgress(Math.min(1, seen / (total || 1)));
+    }
+  }
+  if (rest) onLine(rest.endsWith('\r') ? rest.slice(0, -1) : rest);
+}
+
+// ---- CSV ----
+
+// RFC 4180 text -> rows of strings (quotes, "" escapes, CRLF).
+function parseCSV(text, delim) {
+  const rows = [];
+  const n = text.length;
+  let row = [];
+  let field = '';
+  let quoted = false;
+  let i = 0;
+  while (i < n) {
+    const c = text[i];
+    if (quoted) {
+      if (c === '"') {
+        if (text[i + 1] === '"') { field += '"'; i += 2; continue; }
+        quoted = false; i++; continue;
+      }
+      field += c; i++; continue;
+    }
+    if (c === '"' && field === '') { quoted = true; i++; continue; }
+    if (c === delim) { row.push(field); field = ''; i++; continue; }
+    if (c === '\r' || c === '\n') {
+      row.push(field); rows.push(row); row = []; field = '';
+      if (c === '\r' && text[i + 1] === '\n') i++;
+      i++; continue;
+    }
+    field += c; i++;
+  }
+  if (field !== '' || row.length) { row.push(field); rows.push(row); }
+  return rows;
+}
+
+function sniffDelimiter(line) {
+  let best = ',';
+  let bestCount = 0;
+  for (const d of [',', ';', '\t', '|']) {
+    let count = 0;
+    let quoted = false;
+    for (const c of line) {
+      if (c === '"') quoted = !quoted;
+      else if (c === d && !quoted) count++;
+    }
+    if (count > bestCount) { best = d; bestCount = count; }
+  }
+  return best;
+}
+
+function csvCell(v) {
+  const s = v === null || v === undefined ? '' : String(v);
+  return /[",\r\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+}
+
+// Text of a CSV or EIN list -> {fieldnames, rows, einField}; throws on a missing EIN column.
+function readInput(text, column) {
+  if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
+  const lines = text.split(/\r\n|\n|\r/).filter(l => l.trim());
+  if (!lines.length) return {fieldnames: [], rows: [], einField: null};
+  const table = parseCSV(lines.join('\n'), sniffDelimiter(lines[0]));
+  const header = table[0].map(h => h.trim());
+  let idx = null;
+  if (column) {
+    const lowered = header.map(h => h.toLowerCase());
+    idx = lowered.indexOf(column.toLowerCase());
+    if (idx < 0) throw new Error('column "' + column + '" not found; the columns are: ' + header.join(', '));
+  } else {
+    const i = header.findIndex(h => EIN_HEADER.test(h.toLowerCase()));
+    idx = i < 0 ? null : i;
+  }
+  if (idx === null) {
+    if (normalizeEin(header[0]) === null) {
+      throw new Error('no EIN column found; name it "EIN" or type its name in the box above');
+    }
+    // Headerless list: one EIN per line (extra columns are kept).
+    const width = table.reduce((w, r) => Math.max(w, r.length), 0);
+    const fieldnames = ['ein'];
+    for (let i = 1; i < width; i++) fieldnames.push('column_' + (i + 1));
+    const rows = table.map(r => Object.fromEntries(fieldnames.map((f, i) => [f, r[i] === undefined ? '' : r[i]])));
+    return {fieldnames, rows, einField: 'ein'};
+  }
+  const fieldnames = [];
+  header.forEach((h, i) => {
+    let name = h || 'column_' + (i + 1);
+    while (fieldnames.includes(name)) name += '_';
+    fieldnames.push(name);
+  });
+  const rows = table.slice(1).map(r => Object.fromEntries(fieldnames.map((f, i) => [f, r[i] === undefined ? '' : r[i]])));
+  return {fieldnames, rows, einField: fieldnames[idx]};
+}
+
+// ---- IRS file loaders (same rules as charity_check.py) ----
+
+function leadingEin(line, sep) {
+  const cut = line.indexOf(sep);
+  let raw = (cut < 0 ? line : line.slice(0, cut)).trim();
+  if (raw.startsWith('"') && raw.endsWith('"')) raw = raw.slice(1, -1);
+  return /^\d+$/.test(raw) ? raw.padStart(9, '0') : null;
+}
+
+async function loadPub78(file, wanted, progress) {
+  const found = new Map();
+  await eachLine(file, line => {
+    const ein = leadingEin(line, '|');
+    if (!ein || !wanted.has(ein)) return;
+    const parts = line.split('|');
+    if (parts.length < 6) return;
+    const codes = parts[parts.length - 1].trim().toUpperCase().split(/[,;\s]+/).filter(Boolean);
+    let rec = found.get(ein);
+    if (!rec) {
+      rec = {name: parts[1].trim(), city: parts[2].trim(), state: parts[3].trim(), country: parts[4].trim(), codes: []};
+      found.set(ein, rec);
+    }
+    for (const c of codes) if (!rec.codes.includes(c)) rec.codes.push(c);
+  }, progress);
+  return found;
+}
+
+async function loadRevocations(file, wanted, progress) {
+  const found = new Map();
+  await eachLine(file, line => {
+    const ein = leadingEin(line, '|');
+    if (!ein || !wanted.has(ein)) return;
+    let parts = line.split('|');
+    if (parts.length < 10) return;
+    while (parts.length < 12) parts.push('');
+    if (!found.has(ein)) found.set(ein, []);
+    found.get(ein).push({
+      name: parts[1].trim(),
+      dba: parts[2].trim(),
+      city: parts[4].trim(),
+      state: parts[5].trim(),
+      exemption_type: parts[8].trim(),
+      revocation_date: parseIrsDate(parts[9]),
+      posting_date: parseIrsDate(parts[10]),
+      reinstatement_date: parseIrsDate(parts[11]),
+    });
+  }, progress);
+  return found;
+}
+
+async function loadEpostcard(file, wanted, progress) {
+  const found = new Map();
+  await eachLine(file, line => {
+    const ein = leadingEin(line, '|');
+    if (!ein || !wanted.has(ein)) return;
+    const parts = line.split('|');
+    if (parts.length < 7) return;
+    while (parts.length < 26) parts.push('');
+    const rec = {
+      tax_year: parts[1].replace(/\D/g, '').slice(0, 4),
+      name: parts[2].trim(),
+      terminated: TRUE_VALUES.includes(parts[4].trim().toUpperCase()),
+      period_end: parseIrsDate(parts[6]),
+      city: parts[18].trim(),
+      state: parts[20].trim(),
+    };
+    const old = found.get(ein);
+    if (!old || rec.tax_year > old.tax_year || (rec.tax_year === old.tax_year && rec.period_end >= old.period_end)) {
+      found.set(ein, rec);
+    }
+  }, progress);
+  return found;
+}
+
+// EO BMF CSVs -> Map(ein -> fields) for wanted EINs; fills centrals with every group-exemption holder.
+async function loadBmf(files, wanted, centrals, progress) {
+  const found = new Map();
+  for (const file of files) {
+    let col = null;
+    await eachLine(file, line => {
+      if (col === null) {
+        col = {};
+        parseCSV(line, ',')[0].forEach((h, i) => { col[h.trim().toUpperCase()] = i; });
+        if (col.EIN === undefined) throw new Error(file.name + ' has no EIN column; is it an EO BMF file (eo1.csv to eo4.csv)?');
+        return;
+      }
+      const ein = leadingEin(line, ',');
+      if (!ein) return;
+      const want = wanted.has(ein) && !found.has(ein);
+      // Quick test before parsing: only rows we want, or that may hold a group exemption.
+      if (!want && !/,"?[68]"?,/.test(line)) return;
+      const cells = line.includes('"') ? (parseCSV(line, ',')[0] || []) : line.split(',');
+      const get = k => (col[k] === undefined ? '' : (cells[col[k]] || '').trim());
+      if (want) {
+        const rec = {};
+        for (const k of BMF_FIELDS) rec[k] = get(k);
+        found.set(ein, rec);
+      }
+      if (GROUP_PARENT_CODES.includes(get('AFFILIATION'))) {
+        const gen = groupKey(get('GROUP'));
+        if (gen && !centrals.has(gen)) centrals.set(gen, {ein, name: get('NAME')});
+      }
+    }, progress);
+  }
+  return found;
+}
+
+function latestRevocation(records) {
+  if (!records || !records.length) return null;
+  let best = records[0];
+  for (const r of records) {
+    if (r.revocation_date > best.revocation_date ||
+        (r.revocation_date === best.revocation_date && r.posting_date > best.posting_date)) best = r;
+  }
+  return best;
+}
+
+// ---- assessment (mirrors assess() in charity_check.py) ----
+
+function groupCentralNote(b, central, pub78, revocations, flags) {
+  if (!central) {
+    return 'No organization holding group exemption ' + b.GROUP + ' was found in the Business Master File searched.';
+  }
+  const held = 'Group exemption ' + b.GROUP + ' is held by ' + central.name + ' (EIN ' + formatEin(central.ein) + ')';
+  const cp = pub78.get(central.ein);
+  const crev = latestRevocation(revocations.get(central.ein));
+  if (crev && !crev.reinstatement_date) {
+    flags.push('group_central_unconfirmed');
+    return held + ', whose own exemption was automatically revoked ' + crev.revocation_date +
+      '; ask the organization for a current group exemption letter.';
+  }
+  if (cp) return held + ', which is listed in Publication 78 (code ' + cp.codes.join(',') + ').';
+  flags.push('group_central_unconfirmed');
+  return held + ", which is not in Publication 78; ask the organization for the central organization's " +
+    'group exemption letter and proof that it is included in the group.';
+}
+
+function assess(ein, pub78, revocations, bmf, bmfChecked, epostcard, centrals) {
+  const out = {};
+  for (const f of OUTPUT_FIELDS) out[f] = '';
+  if (ein === null) {
+    out.irs_status = 'invalid_ein';
+    out.irs_deductible = 'unknown';
+    out.irs_note = 'Not a 9-digit EIN.';
+    return out;
+  }
+  out.ein_9 = formatEin(ein);
+  const flags = [];
+  const p = pub78.get(ein);
+  const rev = latestRevocation(revocations.get(ein));
+  const b = bmf.get(ein);
+  const n = epostcard.get(ein);
+  const revokedNow = !!rev && !rev.reinstatement_date;
+  let groupNote = '';
+
+  if (p) {
+    out.irs_pub78_code = p.codes.join(',');
+    out.irs_pub78_meaning = p.codes.map(c => PUB78_CODES[c] || 'Unknown code').join('; ');
+    out.irs_name = p.name; out.irs_city = p.city; out.irs_state = p.state;
+    for (const c of p.codes) if (PUB78_FLAGS[c]) flags.push(PUB78_FLAGS[c]);
+  }
+  if (rev) {
+    out.irs_revocation_date = rev.revocation_date;
+    out.irs_reinstatement_date = rev.reinstatement_date;
+    if (rev.reinstatement_date) flags.push('reinstated_after_revocation');
+    if (!out.irs_name) { out.irs_name = rev.name; out.irs_city = rev.city; out.irs_state = rev.state; }
+  }
+  if (b) {
+    const sub = b.SUBSECTION;
+    out.irs_subsection = /^\d+$/.test(sub) ? '501(c)(' + parseInt(sub, 10) + ')' : sub;
+    out.irs_foundation_code = b.FOUNDATION;
+    out.irs_foundation_meaning = FOUNDATION_CODES[b.FOUNDATION] || '';
+    out.irs_ruling = b.RULING;
+    out.irs_ntee = b.NTEE_CD;
+    if (!out.irs_name) { out.irs_name = b.NAME; out.irs_city = b.CITY; out.irs_state = b.STATE; }
+    if (b.FOUNDATION === '10') flags.push('church');
+    const gen = groupKey(b.GROUP);
+    if (GROUP_MEMBER_CODES.includes(b.AFFILIATION) && gen) {
+      flags.push('group_subordinate');
+      out.irs_group_exemption = b.GROUP;
+      const central = centrals.get(gen);
+      if (central) {
+        out.irs_group_central_ein = formatEin(central.ein);
+        out.irs_group_central_name = central.name;
+      }
+      groupNote = groupCentralNote(b, central, pub78, revocations, flags);
+    }
+  }
+  if (n) {
+    out.irs_990n_tax_year = n.tax_year;
+    out.irs_990n_terminated = n.terminated ? 'yes' : 'no';
+    if (n.terminated) flags.push('terminated_990n');
+    if (!out.irs_name) { out.irs_name = n.name; out.irs_city = n.city; out.irs_state = n.state; }
+  }
+
+  if (p && revokedNow) {
+    out.irs_status = 'review';
+    out.irs_deductible = 'unknown';
+    out.irs_note = 'Listed in Publication 78 but also on the auto-revocation list (revoked ' + rev.revocation_date +
+      ', no reinstatement shown). The two files are posted on different days; check IRS TEOS ' + TEOS_URL + '.';
+  } else if (p) {
+    out.irs_status = 'eligible';
+    out.irs_deductible = 'yes';
+    out.irs_note = 'Listed in IRS Publication 78.';
+    if (flags.includes('private_foundation')) {
+      out.irs_note += ' Private foundation: grants from other private foundations may need expenditure responsibility.';
+    }
+    if (flags.includes('type3_non_functionally_integrated') || flags.includes('supporting_org_type_unknown')) {
+      out.irs_note += ' Supporting organization: check the rules on grants from private foundations and donor-advised funds.';
+    }
+  } else if (revokedNow) {
+    out.irs_status = 'revoked';
+    out.irs_deductible = 'no';
+    out.irs_note = 'Tax exemption automatically revoked ' + rev.revocation_date + ' for not filing a return or notice ' +
+      'for three consecutive years; no reinstatement in the IRS file.';
+  } else if (b && (b.SUBSECTION === '03' || b.SUBSECTION === '3')) {
+    out.irs_status = 'listed_bmf_not_pub78';
+    out.irs_deductible = DEDUCTIBILITY_CODES[b.DEDUCTIBILITY] || 'unknown';
+    out.irs_note = 'In the IRS Business Master File as 501(c)(3) but not in Publication 78 ' +
+      '(common for churches, group-exemption subordinates and new organizations). ' +
+      'Rev. Proc. 2011-33 lets donors rely on either list.';
+  } else if (b) {
+    out.irs_status = 'exempt_not_501c3';
+    out.irs_deductible = DEDUCTIBILITY_CODES[b.DEDUCTIBILITY] || 'unknown';
+    out.irs_note = 'Tax-exempt under ' + (out.irs_subsection || 'another subsection') + ', not 501(c)(3).';
+  } else {
+    out.irs_status = 'not_found';
+    out.irs_deductible = 'unknown';
+    const where = bmfChecked ? 'Publication 78, the auto-revocation list or the Business Master File'
+      : 'Publication 78 or the auto-revocation list';
+    out.irs_note = 'Not in ' + where + '. It may be a church, a group-exemption subordinate, a government ' +
+      'unit, a typo or not exempt; look it up in IRS TEOS ' + TEOS_URL + '.';
+    if (n) out.irs_note += ' It did file a 990-N e-Postcard for tax year ' + (n.tax_year || 'unknown') + '.';
+    if (!bmfChecked) out.irs_note += ' Add the Business Master File (eo1.csv to eo4.csv) to search it too.';
+  }
+  if (groupNote) out.irs_note += ' ' + groupNote;
+
+  if (n && n.terminated) {
+    const said = 'Its latest 990-N e-Postcard (tax year ' + (n.tax_year || 'unknown') + ') says the organization has terminated.';
+    if (out.irs_status === 'eligible' || out.irs_status === 'listed_bmf_not_pub78') {
+      out.irs_status = 'review';
+      out.irs_deductible = 'unknown';
+      out.irs_note = out.irs_note + ' ' + said + ' IRS lists can lag a termination; confirm the organization still ' +
+        'operates before a grant.';
+    } else {
+      out.irs_note += ' ' + said;
+    }
+  }
+  out.irs_flags = flags.join(';');
+  return out;
+}
+
+// ---- page ----
+
+const $ = id => document.getElementById(id);
+let lastResult = null;
+
+function say(text, isError) {
+  const el = $('status');
+  el.textContent = text;
+  el.className = isError ? 'error' : '';
+}
+
+function tick() {
+  return new Promise(resolve => setTimeout(resolve, 0));
+}
+
+function today() {
+  const d = new Date();
+  return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate());
+}
+
+function needsLook(r) {
+  return r.irs_status !== 'eligible' || !!r.irs_flags;
+}
+
+function el(tag, attrs, children) {
+  const node = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) node.setAttribute(k, v);
+  for (const c of children || []) node.append(c);
+  return node;
+}
+
+function resultTable(items, einField) {
+  const head = el('tr', {}, ['Row', 'EIN', 'IRS name', 'Location', 'Status', 'Code', 'Flags', 'Group exemption', 'Note']
+    .map(h => el('th', {}, [h])));
+  const body = el('tbody');
+  for (const [i, r] of items) {
+    const place = [r.irs_city, r.irs_state].filter(Boolean).join(', ');
+    const group = r.irs_group_exemption
+      ? r.irs_group_exemption + (r.irs_group_central_name ? ': ' + r.irs_group_central_name + ' (' + r.irs_group_central_ein + ')' : '')
+      : '';
+    body.append(el('tr', {}, [
+      el('td', {}, [String(i)]),
+      el('td', {}, [r.ein_9 || r[einField] || '']),
+      el('td', {}, [r.irs_name]),
+      el('td', {}, [place]),
+      el('td', {}, [el('span', {class: 's ' + r.irs_status}, [r.irs_status])]),
+      el('td', {}, [r.irs_pub78_code]),
+      el('td', {}, [r.irs_flags.split(';').filter(Boolean).join(', ')]),
+      el('td', {}, [group]),
+      el('td', {}, [r.irs_note]),
+    ]));
+  }
+  return el('table', {}, [el('thead', {}, [head]), body]);
+}
+
+function render(res) {
+  const box = $('results');
+  box.textContent = '';
+  const counts = {};
+  for (const r of res.rows) counts[r.irs_status] = (counts[r.irs_status] || 0) + 1;
+  const numbered = res.rows.map((r, i) => [i + 1, r]);
+  const look = numbered.filter(([, r]) => needsLook(r));
+
+  box.append(el('h2', {}, ['Results']));
+  box.append(el('p', {}, [res.rows.length + ' rows checked on ' + res.checkedOn + ' with charity-check ' + VERSION + '.']));
+  const buttons = el('p', {class: 'noprint'});
+  const csvButton = el('button', {type: 'button'}, ['Download CSV']);
+  csvButton.addEventListener('click', downloadCsv);
+  const printButton = el('button', {type: 'button'}, ['Print or save as PDF']);
+  printButton.addEventListener('click', () => window.print());
+  buttons.append(csvButton, printButton);
+  box.append(buttons);
+
+  const totals = el('tbody');
+  for (const s of STATUSES) {
+    if (counts[s]) totals.append(el('tr', {}, [el('td', {}, [el('span', {class: 's ' + s}, [s])]), el('td', {}, [String(counts[s])])]));
+  }
+  box.append(el('h3', {}, ['Totals']));
+  box.append(el('table', {}, [el('thead', {}, [el('tr', {}, [el('th', {}, ['Status']), el('th', {}, ['Rows'])])]), totals]));
+
+  box.append(el('h3', {}, ['Rows that need a look (' + look.length + ')']));
+  box.append(look.length ? resultTable(look, res.einField) : el('p', {}, ['None: every row is in Publication 78 with no flags.']));
+  const all = el('details', {}, [el('summary', {}, ['All ' + res.rows.length + ' rows'])]);
+  all.append(resultTable(numbered, res.einField));
+  box.append(all);
+
+  box.append(el('h3', {}, ['IRS files used']));
+  const ul = el('ul');
+  for (const [label, file] of res.sources) {
+    const saved = new Date(file.lastModified);
+    ul.append(el('li', {}, [label + ': ' + file.name + ' (saved ' + saved.getFullYear() + '-' + pad2(saved.getMonth() + 1) + '-' +
+      pad2(saved.getDate()) + ')']));
+  }
+  box.append(ul);
+}
+
+function downloadCsv() {
+  if (!lastResult) return;
+  const res = lastResult;
+  const columns = res.fieldnames.slice();
+  for (const c of OUTPUT_FIELDS.concat(['irs_checked_on'])) if (!columns.includes(c)) columns.push(c);
+  const lines = [columns.map(csvCell).join(',')];
+  for (const r of res.rows) lines.push(columns.map(c => csvCell(r[c])).join(','));
+  // A byte-order mark so that Excel reads the names as UTF-8.
+  const blob = new Blob(['﻿' + lines.join('\r\n') + '\r\n'], {type: 'text/csv;charset=utf-8'});
+  const a = el('a', {href: URL.createObjectURL(blob), download: 'charity-check-' + res.checkedOn + '.csv'});
+  document.body.append(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+}
+
+async function run() {
+  const button = $('run');
+  button.disabled = true;
+  $('results').textContent = '';
+  try {
+    if (typeof DecompressionStream === 'undefined' || typeof TextDecoderStream === 'undefined') {
+      throw new Error('this browser is too old for this page; use a current Chrome, Edge, Firefox or Safari');
+    }
+    let text = $('list').value;
+    const listFile = $('listFile').files[0];
+    if (listFile) text = await listFile.text();
+    const input = readInput(text, $('column').value.trim());
+    if (!input.rows.length) throw new Error('your list is empty: paste EINs or choose a file in step 1');
+    const pub78File = $('pub78File').files[0];
+    const revFile = $('revFile').files[0];
+    if (!pub78File || !revFile) throw new Error('choose the Publication 78 and revocation files in step 2');
+    const n990File = $('n990File').files[0] || null;
+    const bmfFiles = Array.from($('bmfFiles').files);
+
+    const einField = input.einField;
+    const raws = input.rows.map(r => r[einField] || '');
+    const normalized = new Map(raws.map(raw => [raw, normalizeEin(raw)]));
+    const wanted = new Set([...normalized.values()].filter(Boolean));
+    const progress = label => async frac => { say(label + ' ' + Math.round(frac * 100) + '%'); await tick(); };
+
+    const centrals = new Map();
+    let bmf = new Map();
+    if (bmfFiles.length) {
+      say('Reading the Business Master File...');
+      await tick();
+      bmf = await loadBmf(bmfFiles, wanted, centrals, progress('Reading the Business Master File'));
+    }
+    const lookup = new Set(wanted);
+    for (const b of bmf.values()) {
+      const gen = groupKey(b.GROUP);
+      if (GROUP_MEMBER_CODES.includes(b.AFFILIATION) && centrals.has(gen)) lookup.add(centrals.get(gen).ein);
+    }
+    say('Reading Publication 78...');
+    await tick();
+    const pub78 = await loadPub78(pub78File, lookup, progress('Reading Publication 78'));
+    say('Reading the revocation list...');
+    await tick();
+    const revocations = await loadRevocations(revFile, lookup, progress('Reading the revocation list'));
+    let epostcard = new Map();
+    if (n990File) {
+      say('Reading the 990-N e-Postcard file...');
+      await tick();
+      epostcard = await loadEpostcard(n990File, wanted, progress('Reading the 990-N file'));
+    }
+
+    const checkedOn = today();
+    const results = new Map();
+    for (const [raw, ein] of normalized) {
+      results.set(raw, assess(ein, pub78, revocations, bmf, bmfFiles.length > 0, epostcard, centrals));
+    }
+    const rows = input.rows.map(r => Object.assign({}, r, results.get(r[einField] || ''), {irs_checked_on: checkedOn}));
+    const fieldnames = input.fieldnames.includes(einField) ? input.fieldnames : [einField].concat(input.fieldnames);
+    const sources = [['Publication 78', pub78File], ['Automatic revocation list', revFile]]
+      .concat(bmfFiles.map(f => ['EO Business Master File', f]))
+      .concat(n990File ? [['Form 990-N e-Postcard', n990File]] : []);
+    lastResult = {rows, fieldnames, einField, checkedOn, sources};
+    if (pub78.size === 0 && wanted.size > 0) {
+      say('Done, but none of your EINs is in the Publication 78 file you chose. Check that it is the right file.', true);
+    } else {
+      say('Done: ' + rows.length + ' rows checked.');
+    }
+    render(lastResult);
+  } catch (err) {
+    say('Could not check the list: ' + (err && err.message ? err.message : err), true);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+$('version').textContent = VERSION;
+$('run').addEventListener('click', run);
+</script>
+</body>
+</html>
