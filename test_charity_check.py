@@ -293,6 +293,7 @@ class TestFailOn(unittest.TestCase):
         self.assertEqual(cc.parse_fail_on("revoked, review;terminated_990n"),
                          ["revoked", "review", "terminated_990n"])
         self.assertEqual(cc.parse_fail_on("group_central_unconfirmed"), ["group_central_unconfirmed"])
+        self.assertEqual(cc.parse_fail_on("revoked,changed"), ["revoked", "changed"])
         self.assertEqual(cc.parse_fail_on(""), [])
         with self.assertRaises(SystemExit):
             cc.parse_fail_on("revoked,bogus")
@@ -302,6 +303,38 @@ class TestFailOn(unittest.TestCase):
         self.assertTrue(cc.matches_any(row, ["church"]))
         self.assertFalse(cc.matches_any(row, ["revoked"]))
         self.assertTrue(cc.matches_any({"irs_status": "revoked", "irs_flags": ""}, ["revoked"]))
+
+    def test_matches_changed(self):
+        row = {"irs_status": "revoked", "irs_flags": "", "irs_change": "status eligible -> revoked"}
+        self.assertTrue(cc.matches_any(row, ["changed"]))
+        self.assertFalse(cc.matches_any(dict(row, irs_change="new"), ["changed"]))
+        self.assertFalse(cc.matches_any(dict(row, irs_change=""), ["changed"]))
+        self.assertFalse(cc.matches_any({"irs_status": "eligible", "irs_flags": ""}, ["changed"]))
+
+
+class TestDescribeChange(unittest.TestCase):
+    ROW = {"irs_status": "revoked", "irs_pub78_code": "", "irs_revocation_date": "2019-11-15",
+           "irs_reinstatement_date": "", "irs_990n_terminated": "", "irs_flags": "terminated_990n"}
+
+    def test_new(self):
+        self.assertEqual(cc.describe_change(None, self.ROW), "new")
+
+    def test_unchanged(self):
+        self.assertEqual(cc.describe_change(dict(self.ROW, irs_note="older wording"), self.ROW), "")
+
+    def test_status_code_date_and_flags(self):
+        old = {"irs_status": "eligible", "irs_pub78_code": "PC", "irs_revocation_date": "",
+               "irs_reinstatement_date": "", "irs_990n_terminated": "", "irs_flags": "church"}
+        self.assertEqual(cc.describe_change(old, self.ROW),
+                         "status eligible -> revoked; Pub 78 code PC -> (none); "
+                         "revocation date (none) -> 2019-11-15; flags +terminated_990n -church")
+
+    def test_compares_only_columns_the_baseline_has(self):
+        self.assertEqual(cc.describe_change({"irs_status": "eligible"}, self.ROW), "status eligible -> revoked")
+        self.assertEqual(cc.describe_change({"irs_status": "revoked"}, self.ROW), "")
+
+    def test_none_values_from_json(self):
+        self.assertEqual(cc.describe_change(dict(self.ROW, irs_pub78_code=None), self.ROW), "")
 
 
 class TestMain(Fixture):
@@ -317,6 +350,7 @@ class TestMain(Fixture):
         self.assertEqual(rows[0]["Amount"], "500")
         self.assertTrue(rows[0]["irs_checked_on"])
         self.assertIn("irs_990n_terminated", rows[0])
+        self.assertNotIn("irs_change", rows[0])
         self.assertEqual(rows[2]["irs_group_central_name"], "NATIONAL LEAGUE OF PARK FRIENDS, INC")
 
     def test_loose_eins_json(self):
@@ -358,6 +392,7 @@ class TestMain(Fixture):
         self.assertIn("Rows that need a look (2)", page)
         self.assertIn("Form 990-N e-Postcard", page)
         self.assertIn("charity-check " + cc.__version__, page)
+        self.assertNotIn("Changed since the last check", page)
 
     def test_markdown_summary_appends(self):
         out = os.path.join(self.tmp.name, "out.csv")
@@ -369,6 +404,87 @@ class TestMain(Fixture):
         self.assertIn("### charity-check: 2 rows", text)
         self.assertIn("| revoked | 1 |", text)
         self.assertIn("| 2 | 44-4444444 | Gone Charity | revoked |", text)
+
+
+class TestBaseline(Fixture):
+    """--baseline: a scheduled check says what changed since the previous one."""
+
+    def last_month(self):
+        """An earlier check, made when 44-4444444 was still in Pub 78 and not yet revoked."""
+        old_pub78 = self.path("pub78-old.txt", PUB78 + "444444444|Gone Charity|Reno|NV|United States|PC\n")
+        old_rev = self.path("rev-old.txt", "")
+        base = os.path.join(self.tmp.name, "last.csv")
+        rc = cc.main(["53-0196605", "444444444", "-o", base, "--pub78", old_pub78, "--revocation", old_rev])
+        self.assertEqual(rc, 0)
+        return base
+
+    def read(self, path):
+        with open(path, encoding="utf-8", newline="") as fh:
+            return list(csv.DictReader(fh))
+
+    def test_reports_changes_and_fails_on_them(self):
+        base = self.last_month()
+        out = os.path.join(self.tmp.name, "out.csv")
+        report = os.path.join(self.tmp.name, "report.html")
+        summary = self.path("summary.md", "")
+        rc = cc.main(["53-0196605", "444444444", "999999999", "bad", "-o", out, "--baseline", base,
+                      "--fail-on", "changed", "--html", report, "--summary", summary] + self.local())
+        self.assertEqual(rc, 1)
+        rows = self.read(out)
+        self.assertEqual([r["irs_change"] for r in rows], [
+            "", "status eligible -> revoked; Pub 78 code PC -> (none); revocation date (none) -> 2019-11-15",
+            "new", ""])
+        header = list(rows[0])
+        self.assertEqual(header.index("irs_change") + 1, header.index("irs_checked_on"))
+        with open(report, encoding="utf-8") as fh:
+            page = fh.read()
+        self.assertIn("Changed since the last check (1)", page)
+        self.assertIn("status eligible -&gt; revoked", page)
+        self.assertIn("1 rows were not in the earlier check.", page)
+        with open(summary, encoding="utf-8") as fh:
+            text = fh.read()
+        self.assertIn("**Changed since the last check: 1**", text)
+        self.assertIn("| 2 | 44-4444444 | Gone Charity | revoked | status eligible -> revoked;", text)
+
+    def test_same_file_as_output_and_no_change(self):
+        base = self.last_month()
+        self.assertEqual(cc.main(["53-0196605", "444444444", "-o", base, "--baseline", base] + self.local()), 0)
+        self.assertEqual(cc.main(["53-0196605", "444444444", "-o", base, "--baseline", base,
+                                  "--fail-on", "changed"] + self.local()), 0)
+        self.assertEqual([r["irs_change"] for r in self.read(base)], ["", ""])
+
+    def test_json_baseline(self):
+        base = os.path.join(self.tmp.name, "last.json")
+        cc.main(["53-0196605", "--json", "-o", base] + self.local())
+        out = os.path.join(self.tmp.name, "out.json")
+        cc.main(["53-0196605", "131623829", "--json", "-o", out, "--baseline", base] + self.local())
+        with open(out, encoding="utf-8") as fh:
+            data = json.load(fh)
+        self.assertEqual([d["irs_change"] for d in data], ["", "new"])
+
+    def test_older_output_with_fewer_columns(self):
+        base = self.path("old.csv", "ein,ein_9,irs_status\n444444444,44-4444444,eligible\n")
+        out = os.path.join(self.tmp.name, "out.csv")
+        cc.main(["444444444", "-o", out, "--baseline", base] + self.local())
+        self.assertEqual(self.read(out)[0]["irs_change"], "status eligible -> revoked")
+
+    def test_rejects_a_file_that_is_not_an_output(self):
+        plain = self.path("plain.csv", "EIN\n53-0196605\n")
+        with self.assertRaises(SystemExit):
+            cc.main(["53-0196605", "--baseline", plain] + self.local())
+
+    def test_fail_on_changed_needs_baseline(self):
+        with self.assertRaises(SystemExit):
+            cc.main(["53-0196605", "--fail-on", "changed"] + self.local())
+
+    def test_stale_change_column_is_dropped_without_baseline(self):
+        src = self.path("again.csv", "EIN,irs_change\n53-0196605,status eligible -> revoked\n")
+        out = os.path.join(self.tmp.name, "out.csv")
+        report = os.path.join(self.tmp.name, "report.html")
+        cc.main([src, "-o", out, "--html", report] + self.local())
+        self.assertEqual(self.read(out)[0]["irs_change"], "")
+        with open(report, encoding="utf-8") as fh:
+            self.assertNotIn("Changed since the last check", fh.read())
 
 
 def find_web_page():
@@ -414,6 +530,11 @@ class TestWebPage(unittest.TestCase):
         self.assertEqual(self.js_list("BMF_FIELDS"), list(cc.BMF_FIELDS))
         self.assertEqual(self.js_list("GROUP_PARENT_CODES"), list(cc.GROUP_PARENT_CODES))
         self.assertEqual(self.js_list("GROUP_MEMBER_CODES"), list(cc.GROUP_MEMBER_CODES))
+        self.assertEqual(self.js_list("CHANGE_FIELDS"), [x for pair in cc.CHANGE_FIELDS for x in pair])
+
+    def test_same_change_wording(self):
+        for text in ("' -> '", "'(none)'", "'flags '", "'new'", "'; '"):
+            self.assertIn(text, self.page)
 
     def test_makes_no_network_requests(self):
         csp = re.search(r'<meta http-equiv="Content-Security-Policy" content="([^"]+)"', self.page)

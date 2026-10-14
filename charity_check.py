@@ -5,7 +5,8 @@ Give it a CSV (or a plain list) of EINs. It downloads the IRS Publication 78 lis
 (organizations eligible to receive tax-deductible contributions) and the
 automatic-revocation list, optionally the Exempt Organizations Business Master
 File (EO BMF) and the Form 990-N (e-Postcard) file, and writes your file back
-with a status for every row.
+with a status for every row. With --baseline it also says what changed since an
+earlier check.
 
 Standard library only. Information from public IRS data, not legal or tax advice.
 By MV2 of Munim, Inc. MIT license.
@@ -24,7 +25,7 @@ import zipfile
 from datetime import date, datetime, timezone
 from html import escape
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 PUB78_URL = "https://apps.irs.gov/pub/epostcard/data-download-pub78.zip"
 REVOCATION_URL = "https://apps.irs.gov/pub/epostcard/data-download-revocation.zip"
@@ -112,6 +113,15 @@ STATUSES = ("eligible", "listed_bmf_not_pub78", "exempt_not_501c3", "revoked",
             "review", "not_found", "invalid_ein")
 
 KNOWN_FLAGS = tuple(PUB78_FLAGS.values()) + OTHER_FLAGS
+
+# --fail-on value for rows that changed since the --baseline check.
+CHANGE_TOKEN = "changed"
+
+# Columns compared with --baseline, and the words used to describe a change.
+CHANGE_FIELDS = (("irs_status", "status"), ("irs_pub78_code", "Pub 78 code"),
+                 ("irs_revocation_date", "revocation date"),
+                 ("irs_reinstatement_date", "reinstatement date"),
+                 ("irs_990n_terminated", "990-N terminated"))
 
 MONTHS = {m: i + 1 for i, m in enumerate(
     ("JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"))}
@@ -481,6 +491,62 @@ def read_input(path, column=None):
     return fieldnames, rows, fieldnames[idx]
 
 
+def load_baseline(path):
+    """An earlier charity-check output (CSV or JSON) -> {ein: row}."""
+    if path.lower().endswith(".json"):
+        with open(path, encoding="utf-8-sig") as fh:
+            try:
+                rows = json.load(fh)
+            except ValueError:
+                raise SystemExit("charity-check: --baseline %s is not valid JSON" % path)
+        rows = rows if isinstance(rows, list) else []
+        ein_field = "ein"
+    else:
+        _, rows, ein_field = read_input(path)
+    rows = [r for r in rows if isinstance(r, dict)]
+    if rows and not any("irs_status" in r for r in rows):
+        raise SystemExit("charity-check: --baseline %s is not a charity-check output (no irs_status column)"
+                         % path)
+    found = {}
+    for r in rows:
+        if "irs_status" not in r:
+            continue
+        ein = normalize_ein(r.get("ein_9")) or normalize_ein(r.get(ein_field))
+        if ein and ein not in found:
+            found[ein] = r
+    return found
+
+
+def flag_set(text):
+    return {f for f in str(text or "").split(";") if f}
+
+
+def describe_change(old, row):
+    """What changed between a baseline row and a new row: 'new', '' (nothing) or a short description.
+
+    Only columns the baseline has are compared, so an older output compares what it can.
+    """
+    if old is None:
+        return "new"
+    parts = []
+    for field, label in CHANGE_FIELDS:
+        if field not in old:
+            continue
+        a, b = str(old.get(field) or "").strip(), str(row.get(field) or "").strip()
+        if a != b:
+            parts.append("%s %s -> %s" % (label, a or "(none)", b or "(none)"))
+    if "irs_flags" in old:
+        a, b = flag_set(old.get("irs_flags")), flag_set(row.get("irs_flags"))
+        diff = ["+" + f for f in sorted(b - a)] + ["-" + f for f in sorted(a - b)]
+        if diff:
+            parts.append("flags " + " ".join(diff))
+    return "; ".join(parts)
+
+
+def is_changed(row):
+    return row.get("irs_change") not in (None, "", "new")
+
+
 def download(url, dest, max_age_days=7, refresh=False):
     """Download url to dest unless a fresh copy is cached. Returns dest."""
     if not refresh and os.path.exists(dest) and time.time() - os.path.getmtime(dest) < max_age_days * 86400:
@@ -549,15 +615,17 @@ def check(eins, pub78_path, revocation_path, bmf_paths=(), epostcard_path=None):
 def parse_fail_on(text):
     """'revoked, review' -> ['revoked', 'review']; unknown names are an error."""
     names = [t.strip() for t in re.split(r"[,;\s]+", text or "") if t.strip()]
-    unknown = [t for t in names if t not in STATUSES and t not in KNOWN_FLAGS]
+    unknown = [t for t in names if t not in STATUSES and t not in KNOWN_FLAGS and t != CHANGE_TOKEN]
     if unknown:
-        raise SystemExit("charity-check: unknown --fail-on value(s): %s; use statuses (%s) or flags (%s)"
-                         % (", ".join(unknown), ", ".join(STATUSES), ", ".join(KNOWN_FLAGS)))
+        raise SystemExit("charity-check: unknown --fail-on value(s): %s; use statuses (%s), flags (%s) or %s"
+                         % (", ".join(unknown), ", ".join(STATUSES), ", ".join(KNOWN_FLAGS), CHANGE_TOKEN))
     return names
 
 
 def matches_any(row, names):
     flags = row["irs_flags"].split(";") if row["irs_flags"] else []
+    if CHANGE_TOKEN in names and is_changed(row):
+        return True
     return row["irs_status"] in names or any(f in names for f in flags)
 
 
@@ -572,8 +640,13 @@ def count_statuses(rows):
     return counts
 
 
+def compared(rows):
+    """True if the rows were checked against a --baseline."""
+    return any("irs_change" in r for r in rows)
+
+
 def render_html(rows, ein_field, sources, checked_on):
-    """A self-contained HTML report: totals, the rows that need a look, then every row."""
+    """A self-contained HTML report: totals, changes, the rows that need a look, then every row."""
     counts = count_statuses(rows)
     look = [(i, r) for i, r in enumerate(rows, 1) if needs_look(r)]
 
@@ -610,6 +683,23 @@ def render_html(rows, ein_field, sources, checked_on):
         if s in counts:
             parts.append('<tr><td><span class="s %s">%s</span></td><td>%d</td></tr>' % (s, s, counts[s]))
     parts.append("</tbody></table>")
+    if compared(rows):
+        changed = [(i, r) for i, r in enumerate(rows, 1) if is_changed(r)]
+        added = sum(1 for r in rows if r.get("irs_change") == "new")
+        parts.append("<h2>Changed since the last check (%d)</h2>" % len(changed))
+        if changed:
+            parts.append("<table><thead><tr><th>Row</th><th>EIN</th><th>IRS name</th><th>Status</th>"
+                         "<th>Change</th></tr></thead><tbody>")
+            for i, r in changed:
+                parts.append('<tr><td>%d</td><td>%s</td><td>%s</td><td><span class="s %s">%s</span></td>'
+                             "<td>%s</td></tr>" % (i, escape(r["ein_9"]), escape(r["irs_name"]),
+                                                   escape(r["irs_status"]), escape(r["irs_status"]),
+                                                   escape(r["irs_change"])))
+            parts.append("</tbody></table>")
+        else:
+            parts.append("<p>None of the statuses, codes, dates or flags changed.</p>")
+        if added:
+            parts.append("<p>%d rows were not in the earlier check.</p>" % added)
     parts.append("<h2>Rows that need a look (%d)</h2>" % len(look))
     parts.append(table(look) if look else "<p>None: every row is in Publication 78 with no flags.</p>")
     parts.append("<details><summary>All %d rows</summary>" % len(rows))
@@ -631,6 +721,14 @@ def render_markdown(rows, ein_field, limit=50):
     counts = count_statuses(rows)
     lines = ["### charity-check: %d rows" % len(rows), "", "| status | rows |", "|---|---|"]
     lines += ["| %s | %d |" % (s, counts[s]) for s in STATUSES if s in counts]
+    if compared(rows):
+        changed = [(i, r) for i, r in enumerate(rows, 1) if is_changed(r)]
+        lines += ["", "**Changed since the last check: %d**" % len(changed)]
+        if changed:
+            lines += ["", "| row | EIN | IRS name | status | change |", "|---|---|---|---|---|"]
+            for i, r in changed[:limit]:
+                cells = (r["ein_9"], r["irs_name"], r["irs_status"], r["irs_change"])
+                lines.append("| %d | %s |" % (i, " | ".join(c.replace("|", "/") for c in cells)))
     look = [(i, r) for i, r in enumerate(rows, 1) if needs_look(r)]
     if look:
         lines += ["", "| row | EIN | IRS name | status | flags |", "|---|---|---|---|---|"]
@@ -656,9 +754,13 @@ def build_parser():
     ap.add_argument("--json", action="store_true", help="write JSON instead of CSV")
     ap.add_argument("--html", help="also write a self-contained HTML report to this file")
     ap.add_argument("--summary", help="append a Markdown summary to this file (e.g. $GITHUB_STEP_SUMMARY)")
+    ap.add_argument("--baseline",
+                    help="an earlier charity-check output (CSV or JSON); adds an irs_change column saying "
+                         "what changed since then (it may be the same file as --output)")
     ap.add_argument("--fail-on", default="",
                     help="exit with status 1 if any row has one of these statuses or flags "
-                         "(comma-separated, e.g. revoked,review,terminated_990n)")
+                         "(comma-separated, e.g. revoked,review,terminated_990n), or 'changed' "
+                         "for rows that changed since --baseline")
     ap.add_argument("--column", help="name of the EIN column if it is not detected")
     ap.add_argument("--bmf", action="store_true",
                     help="also download and search the EO Business Master File (about 1.9M rows); "
@@ -680,6 +782,10 @@ def main(argv=None):
     args = build_parser().parse_args(argv)
     data_dir = args.data_dir or default_data_dir()
     fail_on = parse_fail_on(args.fail_on)
+    # Read the baseline first: it may be the file --output is about to replace.
+    baseline = load_baseline(args.baseline) if args.baseline else None
+    if CHANGE_TOKEN in fail_on and baseline is None:
+        raise SystemExit("charity-check: --fail-on %s needs --baseline" % CHANGE_TOKEN)
 
     fieldnames, rows, ein_field = [], [], "ein"
     loose = []
@@ -726,9 +832,15 @@ def main(argv=None):
     for row in rows:
         merged = dict(row)
         merged.update(results[row.get(ein_field, "")])
+        if baseline is not None:
+            e = normalize_ein(merged["ein_9"])
+            merged["irs_change"] = describe_change(baseline.get(e), merged) if e else ""
+        else:
+            merged.pop("irs_change", None)  # stale, if the input is an earlier output
         merged["irs_checked_on"] = checked_on
         out_rows.append(merged)
-    columns = list(fieldnames) + [c for c in OUTPUT_FIELDS + ("irs_checked_on",) if c not in fieldnames]
+    extra = ("irs_change",) if baseline is not None else ()
+    columns = list(fieldnames) + [c for c in OUTPUT_FIELDS + extra + ("irs_checked_on",) if c not in fieldnames]
 
     out = open(args.output, "w", encoding="utf-8", newline="") if args.output else sys.stdout
     try:
@@ -753,6 +865,10 @@ def main(argv=None):
     counts = count_statuses(out_rows)
     summary = ", ".join("%s %d" % (s, counts[s]) for s in STATUSES if s in counts)
     sys.stderr.write("charity-check: %d rows: %s\n" % (len(out_rows), summary))
+    if baseline is not None:
+        changed = sum(1 for r in out_rows if is_changed(r))
+        added = sum(1 for r in out_rows if r.get("irs_change") == "new")
+        sys.stderr.write("charity-check: %d rows changed since %s, %d new\n" % (changed, args.baseline, added))
     if fail_on:
         hits = [r for r in out_rows if matches_any(r, fail_on)]
         if hits:

@@ -74,6 +74,16 @@ central organization, and non-501(c)(3) exempt groups). Choose all four:
 <input type="file" id="bmfFiles" accept=".csv,.zip" multiple>
 </fieldset>
 
+<fieldset>
+<legend>3. Compare with an earlier check (optional)</legend>
+<label for="baselineFile">The CSV this page (or the command-line tool) gave you last time:</label>
+<input type="file" id="baselineFile" accept=".csv,text/csv">
+<p class="hint">Rows whose status, Publication 78 code, revocation or reinstatement date, 990-N
+termination or flags changed since then are listed first, and the CSV gets an irs_change column.
+Choose the same optional IRS files both times, or rows will look changed only because a file was
+left out.</p>
+</fieldset>
+
 <button id="run" type="button">Check my list</button>
 <div id="status" role="status" aria-live="polite"></div>
 </div>
@@ -96,7 +106,7 @@ If your organization uses it, an issue saying so (and what would make it more us
 // charity-check in the browser: the same checks as charity_check.py, on files you choose.
 // MV2 of Munim, Inc. - MIT license.
 
-const VERSION = '0.3.0';
+const VERSION = '0.4.0';
 const TEOS_URL = 'https://apps.irs.gov/app/eos/';
 
 const PUB78_CODES = {
@@ -169,6 +179,12 @@ const OUTPUT_FIELDS = [
 
 const STATUSES = ['eligible', 'listed_bmf_not_pub78', 'exempt_not_501c3', 'revoked',
   'review', 'not_found', 'invalid_ein'];
+
+// Columns compared with an earlier check, and the words used to describe a change.
+const CHANGE_FIELDS = [['irs_status', 'status'], ['irs_pub78_code', 'Pub 78 code'],
+  ['irs_revocation_date', 'revocation date'],
+  ['irs_reinstatement_date', 'reinstatement date'],
+  ['irs_990n_terminated', '990-N terminated']];
 
 const MONTHS = {JAN: 1, FEB: 2, MAR: 3, APR: 4, MAY: 5, JUN: 6, JUL: 7, AUG: 8, SEP: 9, OCT: 10, NOV: 11, DEC: 12};
 const EIN_HEADER = /(^|[^a-z])(ein|fein|tin)([^a-z]|$)|tax[ _-]?id|employer identification/;
@@ -656,6 +672,54 @@ function assess(ein, pub78, revocations, bmf, bmfChecked, epostcard, centrals) {
   return out;
 }
 
+// ---- comparing with an earlier check (mirrors load_baseline() and describe_change()) ----
+
+function has(obj, key) {
+  return Object.prototype.hasOwnProperty.call(obj, key);
+}
+
+// Text of an earlier charity-check CSV -> Map(ein -> row).
+function loadBaseline(text) {
+  const input = readInput(text, '');
+  if (input.rows.length && !input.rows.some(r => has(r, 'irs_status'))) {
+    throw new Error('the file in step 3 is not a charity-check CSV (it has no irs_status column)');
+  }
+  const found = new Map();
+  for (const r of input.rows) {
+    const ein = normalizeEin(r.ein_9) || normalizeEin(r[input.einField]);
+    if (ein && !found.has(ein)) found.set(ein, r);
+  }
+  return found;
+}
+
+function flagSet(text) {
+  return new Set(String(text || '').split(';').filter(Boolean));
+}
+
+// 'new', '' (nothing changed) or a short description; only columns the earlier check has are compared.
+function describeChange(old, row) {
+  if (!old) return 'new';
+  const parts = [];
+  for (const [field, label] of CHANGE_FIELDS) {
+    if (!has(old, field)) continue;
+    const a = String(old[field] || '').trim();
+    const b = String(row[field] || '').trim();
+    if (a !== b) parts.push(label + ' ' + (a || '(none)') + ' -> ' + (b || '(none)'));
+  }
+  if (has(old, 'irs_flags')) {
+    const a = flagSet(old.irs_flags);
+    const b = flagSet(row.irs_flags);
+    const diff = [...b].filter(f => !a.has(f)).sort().map(f => '+' + f)
+      .concat([...a].filter(f => !b.has(f)).sort().map(f => '-' + f));
+    if (diff.length) parts.push('flags ' + diff.join(' '));
+  }
+  return parts.join('; ');
+}
+
+function isChanged(r) {
+  return !!r.irs_change && r.irs_change !== 'new';
+}
+
 // ---- page ----
 
 const $ = id => document.getElementById(id);
@@ -711,6 +775,21 @@ function resultTable(items, einField) {
   return el('table', {}, [el('thead', {}, [head]), body]);
 }
 
+function changeTable(items) {
+  const head = el('tr', {}, ['Row', 'EIN', 'IRS name', 'Status', 'Change'].map(h => el('th', {}, [h])));
+  const body = el('tbody');
+  for (const [i, r] of items) {
+    body.append(el('tr', {}, [
+      el('td', {}, [String(i)]),
+      el('td', {}, [r.ein_9]),
+      el('td', {}, [r.irs_name]),
+      el('td', {}, [el('span', {class: 's ' + r.irs_status}, [r.irs_status])]),
+      el('td', {}, [r.irs_change]),
+    ]));
+  }
+  return el('table', {}, [el('thead', {}, [head]), body]);
+}
+
 function render(res) {
   const box = $('results');
   box.textContent = '';
@@ -736,6 +815,14 @@ function render(res) {
   box.append(el('h3', {}, ['Totals']));
   box.append(el('table', {}, [el('thead', {}, [el('tr', {}, [el('th', {}, ['Status']), el('th', {}, ['Rows'])])]), totals]));
 
+  if (res.compared) {
+    const changed = numbered.filter(([, r]) => isChanged(r));
+    const added = res.rows.filter(r => r.irs_change === 'new').length;
+    box.append(el('h3', {}, ['Changed since your last check (' + changed.length + ')']));
+    box.append(changed.length ? changeTable(changed) : el('p', {}, ['None of the statuses, codes, dates or flags changed.']));
+    if (added) box.append(el('p', {}, [added + ' rows were not in the earlier check.']));
+  }
+
   box.append(el('h3', {}, ['Rows that need a look (' + look.length + ')']));
   box.append(look.length ? resultTable(look, res.einField) : el('p', {}, ['None: every row is in Publication 78 with no flags.']));
   const all = el('details', {}, [el('summary', {}, ['All ' + res.rows.length + ' rows'])]);
@@ -756,7 +843,8 @@ function downloadCsv() {
   if (!lastResult) return;
   const res = lastResult;
   const columns = res.fieldnames.slice();
-  for (const c of OUTPUT_FIELDS.concat(['irs_checked_on'])) if (!columns.includes(c)) columns.push(c);
+  const extra = res.compared ? ['irs_change'] : [];
+  for (const c of OUTPUT_FIELDS.concat(extra, ['irs_checked_on'])) if (!columns.includes(c)) columns.push(c);
   const lines = [columns.map(csvCell).join(',')];
   for (const r of res.rows) lines.push(columns.map(c => csvCell(r[c])).join(','));
   // A byte-order mark so that Excel reads the names as UTF-8.
@@ -786,6 +874,9 @@ async function run() {
     if (!pub78File || !revFile) throw new Error('choose the Publication 78 and revocation files in step 2');
     const n990File = $('n990File').files[0] || null;
     const bmfFiles = Array.from($('bmfFiles').files);
+    // Read the earlier check first, so a wrong file is reported before the long IRS reads.
+    const baselineFile = $('baselineFile').files[0] || null;
+    const baseline = baselineFile ? loadBaseline(await baselineFile.text()) : null;
 
     const einField = input.einField;
     const raws = input.rows.map(r => r[einField] || '');
@@ -824,11 +915,19 @@ async function run() {
       results.set(raw, assess(ein, pub78, revocations, bmf, bmfFiles.length > 0, epostcard, centrals));
     }
     const rows = input.rows.map(r => Object.assign({}, r, results.get(r[einField] || ''), {irs_checked_on: checkedOn}));
+    for (const r of rows) {
+      if (baseline) {
+        const e = normalizeEin(r.ein_9);
+        r.irs_change = e ? describeChange(baseline.get(e), r) : '';
+      } else {
+        delete r.irs_change;
+      }
+    }
     const fieldnames = input.fieldnames.includes(einField) ? input.fieldnames : [einField].concat(input.fieldnames);
     const sources = [['Publication 78', pub78File], ['Automatic revocation list', revFile]]
       .concat(bmfFiles.map(f => ['EO Business Master File', f]))
       .concat(n990File ? [['Form 990-N e-Postcard', n990File]] : []);
-    lastResult = {rows, fieldnames, einField, checkedOn, sources};
+    lastResult = {rows, fieldnames, einField, checkedOn, sources, compared: !!baseline};
     if (pub78.size === 0 && wanted.size > 0) {
       say('Done, but none of your EINs is in the Publication 78 file you chose. Check that it is the right file.', true);
     } else {

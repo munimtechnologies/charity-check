@@ -34,6 +34,25 @@ matching programs and donation platforms all have to do this check. The IRS look
 (TEOS) does one organization at a time; paid services do it in bulk. This does it in bulk
 from the same public IRS data, and your list never leaves your machine.
 
+## What changed since last month
+
+A grantee that was fine when you approved it can be revoked, or file a final e-Postcard, a few
+months later. Keep the CSV from your last check and pass it as `--baseline` (or choose it in
+step 3 of the browser page):
+
+```
+python charity_check.py grantees.csv --baseline last-check.csv -o last-check.csv --html report.html
+```
+
+Every row gets an `irs_change` column: empty if nothing that matters changed, `new` if the EIN
+was not in the earlier check, or a short description such as
+`status eligible -> revoked; Pub 78 code PC -> (none); revocation date (none) -> 2026-05-15` or
+`flags +terminated_990n`. The status, Pub 78 code, revocation and reinstatement dates, 990-N
+termination and flags are compared; names and notes are not. The report and the job summary
+list the changed rows first, and `--fail-on changed` exits with status 1 when there are any.
+The baseline may be the same file as `--output`; it is read before it is replaced. Use the same
+options (`--bmf`, `--990n`) each time, or rows will look changed only because a file was left out.
+
 ## Group exemptions
 
 Thousands of congregations, chapters, posts and local units are tax-exempt only through a
@@ -68,37 +87,86 @@ python charity_check.py 53-0196605 --json                                       
   whose latest e-Postcard says it has terminated is flagged `terminated_990n` and moved to
   `review` even if it is still in Pub 78.
 - `--html report.html` writes a single-file report you can open, print or attach to a grant
-  file: totals, the rows that need a look, every row, and the date of each IRS file used.
-- `--fail-on revoked,review` exits with status 1 if any row has one of those statuses or flags,
-  so a nightly job or a donation platform's pipeline can stop on a bad recipient.
-  `--summary FILE` appends a short Markdown table (for example to `$GITHUB_STEP_SUMMARY`).
+  file: totals, changes since the baseline, the rows that need a look, every row, and the date
+  of each IRS file used.
+- `--baseline last.csv` compares with an earlier output (CSV or JSON); see above.
+- `--fail-on revoked,review` exits with status 1 if any row has one of those statuses or flags
+  (or, with `changed`, if any row changed since the baseline), so a nightly job or a donation
+  platform's pipeline can stop on a bad recipient. `--summary FILE` appends a short Markdown
+  table (for example to `$GITHUB_STEP_SUMMARY`).
 - IRS files are downloaded once and cached in `~/.cache/charity-check` for 7 days (31 for the
   BMF). `--refresh` forces a new download; `--data-dir` moves the cache.
 - `--pub78`, `--revocation`, `--bmf-file` and `--epostcard-file` use files you already
   downloaded (zip or text).
 - A summary goes to stderr: `charity-check: 240 rows: eligible 231, revoked 3, not_found 6`.
 
+## Use from Python
+
+An intake or grants pipeline can call it directly; it is one file with no dependencies:
+
+```python
+import charity_check as cc
+
+pub78 = cc.download(cc.PUB78_URL, "irs/pub78.zip")             # re-downloaded after 7 days
+revocations = cc.download(cc.REVOCATION_URL, "irs/revocation.zip")
+results = cc.check(["53-0196605", "58-1766061"], pub78, revocations)
+for ein, r in results.items():
+    print(ein, r["irs_status"], r["irs_flags"], r["irs_note"])
+```
+
+`check()` also takes `bmf_paths` (the four `eo*.csv` files, from `cc.BMF_URLS`) and
+`epostcard_path` (`cc.EPOSTCARD_URL`). Each result has the `irs_*` columns described above.
+
+## Why not just look the EIN up on ProPublica?
+
+ProPublica's Nonprofit Explorer is a great place to read 990s, but its organization record is
+not a status check. On 2026-10-14 its API still returned Cancer Fund of America
+(EIN 58-1766061), one of the sham cancer charities ordered dissolved in a 2016 settlement with
+the FTC and all 50 states, with `subsection_code` 3, which is what a "is it a 501(c)(3)?" test
+usually looks at. Its `data_source` was `xml_backfill`, not a current Business Master File
+snapshot such as `current_2026_09_16`. charity-check reads the IRS's current Publication 78,
+revocation list and BMF instead, so an organization that has dropped out of them is never
+reported as `eligible`.
+
+If you already use the ProPublica API, a cheap guard is to treat a record whose
+`organization.data_source` is not a recent `current_YYYY_MM_DD` snapshot as unverified.
+
 ## As a GitHub Action
 
-Keep your recipient list in a repository and check it on a schedule:
+Keep your recipient list in a repository and check it on a schedule. This workflow keeps the
+last result in the Actions cache, fails when a recipient is revoked or needs review, and also
+fails once when anything changed since the previous run:
 
 ```yaml
 name: check grantees
 on:
   schedule:
-    - cron: "0 7 * * 1"
+    - cron: "0 7 * * 1,4"   # twice a week: Actions deletes caches unused for 7 days
   workflow_dispatch:
 jobs:
   check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: munimv2/charity-check@v0.3.0
+      - uses: actions/cache/restore@v4
+        with:
+          path: last-check.csv
+          key: charity-check-${{ github.run_id }}
+          restore-keys: charity-check-
+      - uses: munimv2/charity-check@v0.4.0
         with:
           file: grantees.csv
           bmf: "true"
           epostcard: "true"
-          fail-on: revoked,review
+          baseline: last-check.csv
+          fail-on: revoked,review,changed
+      - if: always()
+        run: cp charity-check.csv last-check.csv || true
+      - if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: last-check.csv
+          key: charity-check-${{ github.run_id }}
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -109,9 +177,10 @@ jobs:
 ```
 
 Inputs: `file` (required), `fail-on` (default `revoked,review,invalid_ein`; empty never fails),
-`bmf`, `epostcard`, `column`, `output` (default `charity-check.csv`) and `html` (default
-`charity-check.html`). The job summary shows the totals and the rows that need a look. Only
-use this with a private repository if your list is private.
+`bmf`, `epostcard`, `column`, `baseline` (skipped, along with `changed`, on the first run when
+the file does not exist yet), `output` (default `charity-check.csv`) and `html` (default
+`charity-check.html`). The job summary shows the totals, the changes and the rows that need a
+look. Only use this with a private repository if your list is private.
 
 ## Data sources
 
@@ -136,8 +205,8 @@ python -m unittest -v                          # offline, uses small fixtures
 CHARITY_CHECK_LIVE=1 python -m unittest -v     # also downloads the live IRS files and checks their layout
 ```
 
-The offline tests also check that the browser page uses the same codes, statuses, flags and
-columns as the Python code, and that it contains no network calls.
+The offline tests also check that the browser page uses the same codes, statuses, flags,
+columns and change wording as the Python code, and that it contains no network calls.
 
 ## Limits
 

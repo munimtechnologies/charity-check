@@ -9,7 +9,7 @@ inputs:
     description: CSV with an EIN column, or a text file with one EIN per line
     required: true
   fail-on:
-    description: Comma-separated statuses or flags that fail the step; empty never fails
+    description: Comma-separated statuses or flags that fail the step, or 'changed' (needs baseline); empty never fails
     required: false
     default: revoked,review,invalid_ein
   bmf:
@@ -22,6 +22,10 @@ inputs:
     default: "false"
   column:
     description: Name of the EIN column if it is not detected
+    required: false
+    default: ""
+  baseline:
+    description: An earlier charity-check CSV to compare with (adds irs_change); skipped if the file does not exist yet
     required: false
     default: ""
   output:
@@ -43,6 +47,7 @@ runs:
         CC_BMF: ${{ inputs.bmf }}
         CC_EPOSTCARD: ${{ inputs.epostcard }}
         CC_COLUMN: ${{ inputs.column }}
+        CC_BASELINE: ${{ inputs.baseline }}
         CC_OUTPUT: ${{ inputs.output }}
         CC_HTML: ${{ inputs.html }}
       run: |
@@ -50,5 +55,13 @@ runs:
         if [ "$CC_BMF" = "true" ]; then args+=(--bmf); fi
         if [ "$CC_EPOSTCARD" = "true" ]; then args+=(--990n); fi
         if [ -n "$CC_COLUMN" ]; then args+=(--column "$CC_COLUMN"); fi
-        if [ -n "$CC_FAIL_ON" ]; then args+=(--fail-on "$CC_FAIL_ON"); fi
+        fail_on="$CC_FAIL_ON"
+        if [ -n "$CC_BASELINE" ] && [ -f "$CC_BASELINE" ]; then
+          args+=(--baseline "$CC_BASELINE")
+        elif [ -n "$CC_BASELINE" ]; then
+          echo "charity-check: no baseline at $CC_BASELINE yet; this run becomes the first one"
+          # Nothing to compare with on the first run, so 'changed' cannot apply.
+          fail_on=$(echo "$fail_on" | tr ',' '\n' | { grep -vx '[[:space:]]*changed[[:space:]]*' || true; } | paste -sd, -)
+        fi
+        if [ -n "$fail_on" ]; then args+=(--fail-on "$fail_on"); fi
         python3 "$GITHUB_ACTION_PATH/charity_check.py" "${args[@]}"
