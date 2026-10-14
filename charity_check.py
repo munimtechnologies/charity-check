@@ -32,7 +32,7 @@ REVOCATION_URL = "https://apps.irs.gov/pub/epostcard/data-download-revocation.zi
 EPOSTCARD_URL = "https://apps.irs.gov/pub/epostcard/data-download-epostcard.zip"
 BMF_URLS = ["https://www.irs.gov/pub/irs-soi/eo%d.csv" % n for n in (1, 2, 3, 4)]
 TEOS_URL = "https://apps.irs.gov/app/eos/"
-REPO_URL = "https://github.com/munimv2/charity-check"
+REPO_URL = "https://github.com/munimtechnologies/charity-check"
 USER_AGENT = "charity-check/%s (+%s)" % (__version__, REPO_URL)
 
 # https://www.irs.gov/charities-non-profits/tax-exempt-organization-search-deductibility-status-codes

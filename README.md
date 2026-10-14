@@ -153,7 +153,7 @@ jobs:
           path: last-check.csv
           key: charity-check-${{ github.run_id }}
           restore-keys: charity-check-
-      - uses: munimv2/charity-check@v0.4.0
+      - uses: munimtechnologies/charity-check@v0.4.0
         with:
           file: grantees.csv
           bmf: "true"
