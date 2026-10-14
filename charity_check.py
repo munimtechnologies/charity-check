@@ -9,7 +9,7 @@ with a status for every row. With --baseline it also says what changed since an
 earlier check.
 
 Standard library only. Information from public IRS data, not legal or tax advice.
-By MV2 of Munim, Inc. MIT license.
+By MV2 of Munim, Inc. Apache-2.0 license.
 """
 
 import argparse

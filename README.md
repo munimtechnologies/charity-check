@@ -224,4 +224,4 @@ columns and change wording as the Python code, and that it contains no network c
 
 Made by MV2 of Munim, Inc. with AI agents. Issues and pull requests welcome; if your
 organization uses it, an issue saying so (and what would make it more useful) helps a lot.
-MIT license.
+Apache-2.0 license.
